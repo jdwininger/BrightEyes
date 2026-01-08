@@ -53,13 +53,6 @@ struct _BrightEyesWindow {
     GtkWidget *rot_left_btn;
     GtkWidget *rot_right_btn;
 
-    /* Buttons we may disable during video playback */
-    GtkWidget *zoom_out_btn;
-    GtkWidget *zoom_in_btn;
-    GtkWidget *fit_btn;
-    GtkWidget *rot_left_btn;
-    GtkWidget *rot_right_btn;
-    
     /* Config */
     GAppInfo *selected_editor;
     GList *editor_candidates; /* List of GAppInfo* */
