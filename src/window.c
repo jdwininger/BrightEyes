@@ -24,6 +24,7 @@
 static void request_delete_current(BrightEyesWindow *self);
 static void delete_current_now(BrightEyesWindow *self);
 static void on_next_clicked(GtkButton *btn, BrightEyesWindow *self);
+static void on_playback_changed(Viewer *viewer, gboolean playing, BrightEyesWindow *self);
 
 static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const char *tmp_path);
 struct _BrightEyesWindow {
@@ -44,6 +45,20 @@ struct _BrightEyesWindow {
     gboolean viewer_dark_background;
     gboolean confirm_delete;
     gboolean default_fit_to_window; /* TRUE=fit, FALSE=100% */
+
+    /* Buttons we may disable during video playback */
+    GtkWidget *zoom_out_btn;
+    GtkWidget *zoom_in_btn;
+    GtkWidget *fit_btn;
+    GtkWidget *rot_left_btn;
+    GtkWidget *rot_right_btn;
+
+    /* Buttons we may disable during video playback */
+    GtkWidget *zoom_out_btn;
+    GtkWidget *zoom_in_btn;
+    GtkWidget *fit_btn;
+    GtkWidget *rot_left_btn;
+    GtkWidget *rot_right_btn;
     
     /* Config */
     GAppInfo *selected_editor;
@@ -250,6 +265,18 @@ update_title(BrightEyesWindow *self)
 {
     /* User requested application name only */
     gtk_window_set_title(GTK_WINDOW(self), "BrightEyes");
+}
+
+static void
+on_playback_changed(Viewer *viewer, gboolean playing, BrightEyesWindow *self)
+{
+    /* Grey out controls while a video is playing to avoid confusing interactions */
+    gboolean enabled = !playing;
+    if (self->zoom_in_btn) gtk_widget_set_sensitive(self->zoom_in_btn, enabled);
+    if (self->zoom_out_btn) gtk_widget_set_sensitive(self->zoom_out_btn, enabled);
+    if (self->fit_btn) gtk_widget_set_sensitive(self->fit_btn, enabled);
+    if (self->rot_left_btn) gtk_widget_set_sensitive(self->rot_left_btn, enabled);
+    if (self->rot_right_btn) gtk_widget_set_sensitive(self->rot_right_btn, enabled);
 }
 
 /* Public method to open a file */
@@ -1729,6 +1756,10 @@ bright_eyes_window_init(BrightEyesWindow *self)
     /* Connect viewer signals */
     g_signal_connect(self->viewer, "zoom-changed", G_CALLBACK(on_viewer_zoom_changed), self);
     g_signal_connect_swapped(self->viewer, "open-requested", G_CALLBACK(show_open_folder_dialog), self);
+    /* Listen for playback state to gray out controls */
+    g_signal_connect(self->viewer, "playback-changed", G_CALLBACK(on_playback_changed), self);
+    /* Initialize control state according to current playback */
+    on_playback_changed(self->viewer, viewer_is_playing(self->viewer), self);
 
     /* Outer Split View (Thumbnails) - Sidebar at Start */
     self->split_view = ADW_OVERLAY_SPLIT_VIEW(adw_overlay_split_view_new());
@@ -1771,26 +1802,32 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_widget_set_tooltip_text(zoom_out, "Zoom Out");
     g_signal_connect(zoom_out, "clicked", G_CALLBACK(on_zoom_out_clicked), self);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_out);
+    /* Store references so we can grey them out during video playback */
+    self->zoom_out_btn = zoom_out;
 
     GtkWidget *zoom_in = gtk_button_new_from_icon_name("zoom-in-symbolic");
     gtk_widget_set_tooltip_text(zoom_in, "Zoom In");
     g_signal_connect(zoom_in, "clicked", G_CALLBACK(on_zoom_in_clicked), self);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_in);
+    self->zoom_in_btn = zoom_in;
     
     GtkWidget *fit_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
     gtk_widget_set_tooltip_text(fit_btn, "Fit to Window");
     g_signal_connect(fit_btn, "clicked", G_CALLBACK(on_fit_clicked), self);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_btn);
+    self->fit_btn = fit_btn;
 
     GtkWidget *rot_l = gtk_button_new_from_icon_name("object-rotate-left-symbolic");
     gtk_widget_set_tooltip_text(rot_l, "Rotate Left");
     g_signal_connect(rot_l, "clicked", G_CALLBACK(on_rotate_left_clicked), self);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_l);
+    self->rot_left_btn = rot_l;
     
     GtkWidget *rot_r = gtk_button_new_from_icon_name("object-rotate-right-symbolic");
     gtk_widget_set_tooltip_text(rot_r, "Rotate Right");
     g_signal_connect(rot_r, "clicked", G_CALLBACK(on_rotate_right_clicked), self);
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_r);
+    self->rot_right_btn = rot_r;
 
     self->slideshow_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
     gtk_widget_set_tooltip_text(self->slideshow_btn, "Toggle Slideshow");
