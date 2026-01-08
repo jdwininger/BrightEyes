@@ -1,0 +1,59 @@
+name: Build RPM and attach to Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch: {}
+
+jobs:
+  build-rpm:
+    name: Build RPM (Fedora container)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version from tag
+        run: |
+          echo "VERSION=${{ github.event.release.tag_name || github.ref_name || github.sha }}" >> $GITHUB_ENV
+
+      - name: Build RPM inside Fedora container
+        uses: addnab/docker-run-action@v3
+        with:
+          image: fedora:latest
+          options: --rm -v ${{ github.workspace }}:/workspace
+          workdir: /workspace
+          run: |
+            set -euo pipefail
+            dnf -y update
+            # Install build deps and packaging tools
+            dnf -y install meson ninja gcc pkgconfig gtk4-devel libadwaita-devel gdk-pixbuf2-devel gstreamer1-devel gstreamer1-plugins-base-devel tesseract-devel lept-devel rpm-build ruby rubygems make which
+            gem install --no-document fpm
+
+            # Build project
+            meson setup build
+            meson compile -C build
+
+            # Stage install into a temporary root
+            rm -rf /tmp/package
+            mkdir -p /tmp/package
+            meson install -C build --destdir=/tmp/package
+
+            # Build RPM from staged files with fpm
+            VERSION="${VERSION#v}"
+            fpm -s dir -t rpm -n brighteyes -v "$VERSION" --license MIT \
+                --url "https://github.com/jdwininger/BrightEyes" \
+                --description "BrightEyes image/video viewer" \
+                --iteration 1 \
+                -C /tmp/package .
+
+            mkdir -p artifacts
+            mv *.rpm artifacts/ || true
+            ls -l artifacts || true
+
+      - name: Upload RPM to Release
+        uses: softprops/turnstyle@v1
+        with:
+          files: artifacts/*.rpm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
