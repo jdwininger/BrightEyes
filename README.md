@@ -40,7 +40,7 @@ There is a Flatpak manifest at `org.jeremy.BrightEyes.yml` at the repo root. I a
 To publish on Flathub:
 
 1. Ensure the manifest is correct and AppStream metadata/icons are available.
-2. Create a PR to `https://github.com/flathub/thirdparty` adding `thirdparty/org.brightEyes.BrightEyes` with the manifest and any additional metadata required by Flathub.
+2. Create a PR to `https://github.com/flathub/thirdparty` adding `thirdparty/org.jeremy.BrightEyes` with the manifest and any additional metadata required by Flathub.
 3. Flathub maintainers will review and merge; once merged Flathub builds and distributes the Flatpak.
 
 If you'd like, I can prepare a draft PR for Flathub for you to review.

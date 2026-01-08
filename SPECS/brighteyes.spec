@@ -89,9 +89,9 @@ fi
 %license LICENSE
 %doc README.md
 /usr/bin/brighteyes
-/usr/share/applications/org.brightEyes.BrightEyes.desktop
-/usr/share/icons/hicolor/1024x1024/apps/org.brightEyes.BrightEyes.png
-/usr/share/icons/hicolor/512x512/apps/org.brightEyes.BrightEyes.png
+/usr/share/applications/org.jeremy.BrightEyes.desktop
+/usr/share/icons/hicolor/1024x1024/apps/org.jeremy.BrightEyes.png
+/usr/share/icons/hicolor/512x512/apps/org.jeremy.BrightEyes.png
 
 %changelog
 * Wed Jan 07 2026 Your Name <you@example.org> - 0.1-1

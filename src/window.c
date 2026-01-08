@@ -1581,10 +1581,10 @@ on_about_action(GSimpleAction *action, GVariant *parameter, gpointer user_data)
     
     AdwAboutDialog *dialog = ADW_ABOUT_DIALOG(adw_about_dialog_new());
     adw_about_dialog_set_application_name(dialog, "BrightEyes");
-    adw_about_dialog_set_application_icon(dialog, "org.brightEyes.BrightEyes");
+    adw_about_dialog_set_application_icon(dialog, "org.jeremy.BrightEyes");
     
     /* Explicitly load logo resource to ensure it appears */
-    GdkTexture *logo = gdk_texture_new_from_resource("/org/brighteyes/BrightEyes/icons/hicolor/1024x1024/apps/org.brightEyes.BrightEyes.png");
+    GdkTexture *logo = gdk_texture_new_from_resource("/org/jeremy/BrightEyes/icons/hicolor/1024x1024/apps/org.jeremy.BrightEyes.png");
     if (logo) {
         /* AdwAboutDialog usually derives its logo from the icon name.
            However, if for some reason resource lookup fails, we can try to force it 

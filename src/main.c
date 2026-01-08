@@ -21,9 +21,9 @@ startup(GApplication *app, gpointer user_data)
     GdkDisplay *display = gdk_display_get_default();
     if (display) {
         GtkIconTheme *theme = gtk_icon_theme_get_for_display(display);
-        gtk_icon_theme_add_resource_path(theme, "/org/brighteyes/BrightEyes/icons");
+        gtk_icon_theme_add_resource_path(theme, "/org/jeremy/BrightEyes/icons");
     }
-    gtk_window_set_default_icon_name("org.brightEyes.BrightEyes");
+    gtk_window_set_default_icon_name("org.jeremy.BrightEyes");
 }
 
 static void
@@ -61,7 +61,7 @@ main(int argc, char **argv)
     g_setenv("GSK_RENDERER", "cairo", FALSE);
 
     adw_init();
-    AdwApplication *app = adw_application_new("org.brightEyes.BrightEyes", G_APPLICATION_HANDLES_OPEN);
+    AdwApplication *app = adw_application_new("org.jeremy.BrightEyes", G_APPLICATION_HANDLES_OPEN);
     g_signal_connect(app, "startup", G_CALLBACK(startup), NULL);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     g_signal_connect(app, "open", G_CALLBACK(open), NULL);

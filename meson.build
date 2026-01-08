@@ -37,8 +37,8 @@ executable('brighteyes', sources + resources,
   install : true
 )
 
-install_data('data/org.brightEyes.BrightEyes.desktop', install_dir : 'share/applications')
-install_data('icon-1024.png', install_dir : 'share/icons/hicolor/1024x1024/apps', rename : 'org.brightEyes.BrightEyes.png')
-install_data('icon-1024.png', install_dir : 'share/icons/hicolor/512x512/apps', rename : 'org.brightEyes.BrightEyes.png')
+install_data('data/org.jeremy.BrightEyes.desktop', install_dir : 'share/applications')
+install_data('icon-1024.png', install_dir : 'share/icons/hicolor/1024x1024/apps', rename : 'org.jeremy.BrightEyes.png')
+install_data('icon-1024.png', install_dir : 'share/icons/hicolor/512x512/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('LICENSE', install_dir : 'share/licenses/brighteyes')
 install_data('README.md', install_dir : 'share/doc/brighteyes')
