@@ -11,8 +11,9 @@ export BRIGHTEYES_THUMBNAILS_DEBUG=1
 echo "Running BrightEyes (instrumentation enabled) against: $DIR for ${DUR}s" | tee $LOG
 
 # Start app in background and capture logs
-./build/brighteyes > $LOG 2>&1 &
+./build/brighteyes "$DIR" > $LOG 2>&1 &
 PID=$!
+# Let the UI mount and populate thumbnails
 sleep $DUR
 kill $PID 2>/dev/null || true
 sleep 1
