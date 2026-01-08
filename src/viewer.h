@@ -30,6 +30,9 @@ void viewer_set_default_fit(Viewer *self, gboolean fit);
 
 guint viewer_get_zoom_level_percentage(Viewer *self);
 
+/* Returns TRUE if currently playing a video (GST_STATE_PLAYING). */
+gboolean viewer_is_playing(Viewer *self);
+
 /* Selection API */
 
 /* Returns TRUE if there is an active selection rectangle. */

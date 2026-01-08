@@ -160,7 +160,8 @@ instrumentation_init(void)
     if (instrumentation_enabled) return;
     if (g_getenv("BRIGHTEYES_THUMBNAILS_DEBUG") != NULL) {
         instrumentation_enabled = TRUE;
-        g_debug("THUMBS-INSTR: instrumentation enabled");
+        g_info("THUMBS-INSTR: instrumentation enabled");
+        g_print("THUMBS-INSTR: instrumentation enabled\n");
     }
 }
 
@@ -195,7 +196,8 @@ lru_cache_get(const char *key)
         g_object_ref(val);
         if (instrumentation_enabled) {
             instr_cache_hits++;
-            g_debug("THUMBS-INSTR: cache hit -> %s (hits=%u)", key, instr_cache_hits);
+            g_info("THUMBS-INSTR: cache hit -> %s (hits=%u)", key, instr_cache_hits);
+            g_print("THUMBS-INSTR: cache hit -> %s (hits=%u)\n", key, instr_cache_hits);
         }
         return GDK_PAINTABLE(val);
     }
@@ -356,7 +358,8 @@ on_video_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
 
     if (instrumentation_enabled) {
         instr_video_tasks_completed++;
-        g_debug("THUMBS-INSTR: video task completed for %s (completed=%u)", self->path ? self->path : "(null)", instr_video_tasks_completed);
+        g_info("THUMBS-INSTR: video task completed for %s (completed=%u)", self->path ? self->path : "(null)", instr_video_tasks_completed);
+        g_print("THUMBS-INSTR: video task completed for %s (completed=%u)\n", self->path ? self->path : "(null)", instr_video_tasks_completed);
     }
 
     g_object_unref(self);
@@ -400,7 +403,8 @@ thumbnail_item_ensure_loaded(ThumbnailItem *self)
         /* Cache miss */
         if (instrumentation_enabled) {
             instr_cache_misses++;
-            g_debug("THUMBS-INSTR: cache miss -> %s (misses=%u)", key, instr_cache_misses);
+            g_info("THUMBS-INSTR: cache miss -> %s (misses=%u)", key, instr_cache_misses);
+            g_print("THUMBS-INSTR: cache miss -> %s (misses=%u)\n", key, instr_cache_misses);
         }
         g_free(key);
     }
@@ -417,7 +421,8 @@ thumbnail_item_ensure_loaded(ThumbnailItem *self)
     if (is_video(self->path)) {
         if (instrumentation_enabled) {
             instr_video_tasks_started++;
-            g_debug("THUMBS-INSTR: video task start for %s (started=%u)", self->path, instr_video_tasks_started);
+            g_info("THUMBS-INSTR: video task start for %s (started=%u)", self->path, instr_video_tasks_started);
+            g_print("THUMBS-INSTR: video task start for %s (started=%u)\n", self->path, instr_video_tasks_started);
         }
 
         GTask *task = g_task_new(self, NULL, on_video_loaded, NULL);
@@ -512,7 +517,8 @@ on_item_paintable_notify(ThumbnailItem *item, GParamSpec *pspec, gpointer user_d
     if (bound != item) {
         if (instrumentation_enabled) {
             instr_ignored_notifies++;
-            g_debug("THUMBS-INSTR: ignored notify for item %s (ignored=%u)", item->path ? item->path : "(null)", instr_ignored_notifies);
+            g_info("THUMBS-INSTR: ignored notify for item %s (ignored=%u)", item->path ? item->path : "(null)", instr_ignored_notifies);
+            g_print("THUMBS-INSTR: ignored notify for item %s (ignored=%u)\n", item->path ? item->path : "(null)", instr_ignored_notifies);
         }
         return;
     }
@@ -622,6 +628,9 @@ on_selection_changed(GtkSelectionModel *model, guint position, guint n_items, gp
 static void
 thumbnails_bar_init(ThumbnailsBar *self)
 {
+    /* Ensure instrumentation (if requested) is initialized when the UI starts */
+    instrumentation_init();
+
     static gboolean css_loaded = FALSE;
     if (!css_loaded) {
         GtkCssProvider *provider = gtk_css_provider_new();

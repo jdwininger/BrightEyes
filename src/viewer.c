@@ -59,6 +59,7 @@ struct _Viewer {
 enum {
     SIGNAL_ZOOM_CHANGED,
     SIGNAL_OPEN_REQUESTED,
+    SIGNAL_PLAYBACK_CHANGED,
     N_SIGNALS
 };
 
@@ -139,9 +140,11 @@ on_play_pause_clicked(GtkButton *btn, Viewer *self)
     if (state == GST_STATE_PLAYING) {
         gst_element_set_state(self->playbin, GST_STATE_PAUSED);
         gtk_button_set_icon_name(btn, "media-playback-start-symbolic");
+        g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, FALSE);
     } else {
         gst_element_set_state(self->playbin, GST_STATE_PLAYING);
         gtk_button_set_icon_name(btn, "media-playback-pause-symbolic");
+        g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, TRUE);
     }
 }
 
@@ -436,6 +439,9 @@ viewer_stop_playback (Viewer *self)
 
         gst_element_set_state (self->playbin, GST_STATE_NULL);
         g_clear_object (&self->playbin);
+
+        /* Notify listeners that playback stopped */
+        g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, FALSE);
     }
 }
 
@@ -479,12 +485,33 @@ viewer_class_init(ViewerClass *klass)
                                                 NULL,
                                                 G_TYPE_NONE,
                                                 0);
+
+    signals[SIGNAL_PLAYBACK_CHANGED] = g_signal_new("playback-changed",
+                                                    G_TYPE_FROM_CLASS(klass),
+                                                    G_SIGNAL_RUN_LAST,
+                                                    0,
+                                                    NULL, NULL,
+                                                    NULL,
+                                                    G_TYPE_NONE,
+                                                    1,
+                                                    G_TYPE_BOOLEAN);
 }
 
 Viewer *
 viewer_new(void)
 {
     return g_object_new(TYPE_VIEWER, NULL);
+}
+
+/* Public helper: return TRUE if currently playing (playbin is in PLAYING state) */
+gboolean
+viewer_is_playing(Viewer *self)
+{
+    if (!self || !self->playbin) return FALSE;
+
+    GstState state;
+    gst_element_get_state(self->playbin, &state, NULL, 0);
+    return state == GST_STATE_PLAYING;
 }
 
 static void
@@ -670,6 +697,9 @@ viewer_load_file(Viewer *self, const char *path)
             /* Start Transition for Video */
             const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
             gtk_stack_set_visible_child_name(GTK_STACK(self->image_stack), view_name);
+
+            /* Emit playback changed */
+            g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, TRUE);
         }
     
     } else {

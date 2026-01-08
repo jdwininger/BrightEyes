@@ -1890,7 +1890,8 @@ bright_eyes_window_open_file(BrightEyesWindow *self, const char *path)
         const char *resolved = curator_get_current(self->curator);
         load_image_path(self, resolved);
         
-        /* Refresh sidebar if implemented */
+        /* Refresh sidebar and ensure it is shown so thumbnails bind and load */
         thumbnails_bar_refresh(self->thumbnails);
+        adw_overlay_split_view_set_show_sidebar(self->split_view, TRUE);
     }
 }
