@@ -26,7 +26,7 @@ jobs:
         run: |
           set -eux
           mkdir -p flatpak-build
-          flatpak-builder --force-clean --repo=repo flatpak-build org.brightEyes.BrightEyes.yml
+          flatpak-builder --force-clean --repo=repo flatpak-build org.jeremy.BrightEyes.yml
 
       - name: Make Flatpak bundle
         env:
@@ -34,7 +34,7 @@ jobs:
         run: |
           VERSION=${VERSION#v}
           mkdir -p artifacts
-          flatpak build-bundle repo artifacts/brighteyes-${VERSION}.flatpak org.brightEyes.BrightEyes ${VERSION}
+          flatpak build-bundle repo artifacts/brighteyes-${VERSION}.flatpak org.jeremy.BrightEyes ${VERSION}
           ls -l artifacts
 
       - name: Upload Flatpak artifact

@@ -35,7 +35,7 @@ License: GPLv3
 
 ### Flatpak / Flathub
 
-There is a Flatpak manifest at `org.brightEyes.BrightEyes.yml` at the repo root. I added CI to build a Flatpak bundle on push and on release and upload the bundle as an artifact.
+There is a Flatpak manifest at `org.jeremy.BrightEyes.yml` at the repo root. I added CI to build a Flatpak bundle on push and on release and upload the bundle as an artifact.
 
 To publish on Flathub:
 
