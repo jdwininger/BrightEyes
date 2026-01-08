@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=BrightEyes
+Comment=Image and simple video viewer
+Exec=brighteyes %U
+Icon=org.brightEyes.BrightEyes
+StartupWMClass=brighteyes
+Type=Application
+Categories=Graphics;GNOME;ImageViewer;
+MimeType=image/*;video/*;
+Terminal=false

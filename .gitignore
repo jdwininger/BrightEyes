@@ -1,0 +1,8 @@
+build/
+*.o
+*.so
+*.a
+*.lo
+*.la
+*.log
+.DS_Store

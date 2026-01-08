@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/org/brighteyes/BrightEyes">
+    <file alias="icons/hicolor/1024x1024/apps/org.brightEyes.BrightEyes.png">icon-1024.png</file>
+    <file alias="icons/hicolor/512x512/apps/org.brightEyes.BrightEyes.png">icon-1024.png</file>
+  </gresource>
+</gresources>
