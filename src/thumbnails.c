@@ -111,6 +111,16 @@ static GdkPaintable *lru_cache_get(const char *key);
 static void lru_cache_put(const char *key, GdkPaintable *paintable);
 static void lru_cache_destroy(void);
 
+/* --- Instrumentation counters (optional; enabled by env) --- */
+static guint instr_cache_hits = 0;
+static guint instr_cache_misses = 0;
+static guint instr_ignored_notifies = 0;
+static guint instr_video_tasks_started = 0;
+static guint instr_video_tasks_completed = 0;
+static gboolean instrumentation_enabled = FALSE;
+static void instrumentation_init(void);
+static void thumbnails_print_instrumentation(void);
+
 /* Forward declare helper */
 static gboolean is_video(const char *path);
 
@@ -139,6 +149,27 @@ lru_cache_init(void)
     if (thumbnail_cache_map) return;
     thumbnail_cache_map = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
     thumbnail_cache_lru = g_queue_new();
+
+    /* Initialize instrumentation lazily whenever cache is used */
+    instrumentation_init();
+}
+
+static void
+instrumentation_init(void)
+{
+    if (instrumentation_enabled) return;
+    if (g_getenv("BRIGHTEYES_THUMBNAILS_DEBUG") != NULL) {
+        instrumentation_enabled = TRUE;
+        g_debug("THUMBS-INSTR: instrumentation enabled");
+    }
+}
+
+static void
+thumbnails_print_instrumentation(void)
+{
+    if (!instrumentation_enabled) return;
+    g_info("THUMBS-INSTR: cache_hits=%u cache_misses=%u ignored_notifies=%u video_started=%u video_completed=%u",
+           instr_cache_hits, instr_cache_misses, instr_ignored_notifies, instr_video_tasks_started, instr_video_tasks_completed);
 }
 
 static gchar *
@@ -162,6 +193,10 @@ lru_cache_get(const char *key)
         g_queue_remove(thumbnail_cache_lru, actual_key);
         g_queue_push_tail(thumbnail_cache_lru, actual_key);
         g_object_ref(val);
+        if (instrumentation_enabled) {
+            instr_cache_hits++;
+            g_debug("THUMBS-INSTR: cache hit -> %s (hits=%u)", key, instr_cache_hits);
+        }
         return GDK_PAINTABLE(val);
     }
     return NULL;
@@ -318,6 +353,12 @@ on_video_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
     } else {
         g_clear_error(&err);
     }
+
+    if (instrumentation_enabled) {
+        instr_video_tasks_completed++;
+        g_debug("THUMBS-INSTR: video task completed for %s (completed=%u)", self->path ? self->path : "(null)", instr_video_tasks_completed);
+    }
+
     g_object_unref(self);
 }
 
@@ -356,6 +397,11 @@ thumbnail_item_ensure_loaded(ThumbnailItem *self)
             g_free(key);
             return;
         }
+        /* Cache miss */
+        if (instrumentation_enabled) {
+            instr_cache_misses++;
+            g_debug("THUMBS-INSTR: cache miss -> %s (misses=%u)", key, instr_cache_misses);
+        }
         g_free(key);
     }
 
@@ -369,6 +415,11 @@ thumbnail_item_ensure_loaded(ThumbnailItem *self)
     g_object_ref(self); /* Keep alive during async */
 
     if (is_video(self->path)) {
+        if (instrumentation_enabled) {
+            instr_video_tasks_started++;
+            g_debug("THUMBS-INSTR: video task start for %s (started=%u)", self->path, instr_video_tasks_started);
+        }
+
         GTask *task = g_task_new(self, NULL, on_video_loaded, NULL);
         g_task_set_task_data(task, g_strdup(self->path), g_free);
         /* Use a bounded pool for video processing (heavy) to avoid creating too many threads */
@@ -458,7 +509,13 @@ on_item_paintable_notify(ThumbnailItem *item, GParamSpec *pspec, gpointer user_d
     /* Only update the picture if it is still bound to this item (guard against
        recycled widgets being reused for different items) */
     ThumbnailItem *bound = g_object_get_data(G_OBJECT(picture), "thumbnail-bound-item");
-    if (bound != item) return;
+    if (bound != item) {
+        if (instrumentation_enabled) {
+            instr_ignored_notifies++;
+            g_debug("THUMBS-INSTR: ignored notify for item %s (ignored=%u)", item->path ? item->path : "(null)", instr_ignored_notifies);
+        }
+        return;
+    }
 
     gtk_picture_set_paintable(picture, item->paintable);
 }
@@ -641,6 +698,9 @@ thumbnails_bar_dispose(GObject *object)
 
     /* Destroy in-memory thumbnail cache on dispose to free memory */
     lru_cache_destroy();
+
+    /* If instrumentation was enabled, print a summary to the logs */
+    thumbnails_print_instrumentation();
 
     g_clear_object(&self->curator);
     G_OBJECT_CLASS(thumbnails_bar_parent_class)->dispose(object);
