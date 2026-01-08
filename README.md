@@ -24,4 +24,7 @@ Minimal documentation is available in the `docs/` directory and will be publishe
 - `docs/` contains a short overview and a focused page about the thumbnail improvements (debounce, bounded video worker, in-memory LRU cache).
 - A GitHub Actions workflow `.github/workflows/pages.yml` will publish `docs/` to GitHub Pages on pushes to `main`.
 
+**Published site:** https://jdwininger.github.io/BrightEyes/  
+*(may take a few minutes to appear after the first deploy)*
+
 License: GPLv3
