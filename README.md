@@ -28,3 +28,19 @@ Minimal documentation is available in the `docs/` directory and will be publishe
 *(may take a few minutes to appear after the first deploy)*
 
 License: GPLv3
+
+## Publishing
+
+- GitHub Releases: RPM artifacts are attached by CI.
+
+### Flatpak / Flathub
+
+There is a Flatpak manifest at `org.brightEyes.BrightEyes.yml` at the repo root. I added CI to build a Flatpak bundle on push and on release and upload the bundle as an artifact.
+
+To publish on Flathub:
+
+1. Ensure the manifest is correct and AppStream metadata/icons are available.
+2. Create a PR to `https://github.com/flathub/thirdparty` adding `thirdparty/org.brightEyes.BrightEyes` with the manifest and any additional metadata required by Flathub.
+3. Flathub maintainers will review and merge; once merged Flathub builds and distributes the Flatpak.
+
+If you'd like, I can prepare a draft PR for Flathub for you to review.

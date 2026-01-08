@@ -1,0 +1,52 @@
+name: Build Flatpak bundle
+
+on:
+  push:
+    branches: [ main ]
+  release:
+    types: [ created ]
+  workflow_dispatch: {}
+
+jobs:
+  build-flatpak:
+    name: Build Flatpak bundle
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flatpak tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y flatpak flatpak-builder bubblewrap git 
+          sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
+
+      - name: Build Flatpak
+        run: |
+          set -eux
+          mkdir -p flatpak-build
+          flatpak-builder --force-clean --repo=repo flatpak-build org.brightEyes.BrightEyes.yml
+
+      - name: Make Flatpak bundle
+        env:
+          VERSION: ${{ github.event.release.tag_name || github.ref_name || github.sha }}
+        run: |
+          VERSION=${VERSION#v}
+          mkdir -p artifacts
+          flatpak build-bundle repo artifacts/brighteyes-${VERSION}.flatpak org.brightEyes.BrightEyes ${VERSION}
+          ls -l artifacts
+
+      - name: Upload Flatpak artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-bundle
+          path: artifacts/*.flatpak
+
+      - name: Attach Flatpak to Release (if release created)
+        if: github.event_name == 'release'
+        uses: softprops/turnstyle@v1
+        with:
+          files: artifacts/*.flatpak
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
