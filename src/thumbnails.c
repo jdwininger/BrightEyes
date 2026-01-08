@@ -40,10 +40,15 @@ static void
 thumbnail_item_finalize(GObject *object)
 {
     ThumbnailItem *self = BRIGHTEYES_THUMBNAIL_ITEM(object);
+    /* Cancel any pending delayed load to avoid callbacks after finalization */
+    if (self->load_timeout_id != 0) {
+        g_source_remove(self->load_timeout_id);
+        self->load_timeout_id = 0;
+    }
     g_free(self->path);
     g_clear_object(&self->paintable);
     G_OBJECT_CLASS(thumbnail_item_parent_class)->finalize(object);
-}
+} 
 
 static void
 thumbnail_item_get_property(GObject *object, guint prop_id, GValue *value, GParamSpec *pspec)
@@ -123,6 +128,7 @@ static void thumbnails_print_instrumentation(void);
 
 /* Forward declare helper */
 static gboolean is_video(const char *path);
+static void on_item_destroyed(gpointer data, GObject *where);
 
 static GdkTexture *
 texture_from_pixbuf(GdkPixbuf *pixbuf) {
@@ -527,6 +533,16 @@ on_item_paintable_notify(ThumbnailItem *item, GParamSpec *pspec, gpointer user_d
 }
 
 static void
+on_item_destroyed(gpointer data, GObject *where)
+{
+    GtkWidget *picture = GTK_WIDGET(data);
+    if (picture) {
+        /* Clear any pointer to the destroyed item so future notifies are ignored */
+        g_object_set_data(G_OBJECT(picture), "thumbnail-bound-item", NULL);
+    }
+} 
+
+static void
 bind_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item, gpointer user_data)
 {
     GtkWidget *box = gtk_list_item_get_child(list_item);
@@ -559,14 +575,22 @@ bind_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item, gpoint
        stale notify handlers updating this recycled widget later. */
     ThumbnailItem *prev = g_object_get_data(G_OBJECT(picture), "thumbnail-bound-item");
     if (prev && prev != item) {
-        g_signal_handlers_disconnect_by_func(prev, on_item_paintable_notify, picture);
+        if (G_IS_OBJECT(prev)) {
+            g_signal_handlers_disconnect_by_func(prev, on_item_paintable_notify, picture);
+            g_object_weak_unref(G_OBJECT(prev), (GWeakNotify)on_item_destroyed, picture);
+        } else {
+            /* Clear stale pointer if it points to a non-object (defensive) */
+            g_object_set_data(G_OBJECT(picture), "thumbnail-bound-item", NULL);
+            prev = NULL;
+        }
     }
 
     /* Bind current item -> picture association and hook notify handler */
     g_object_set_data(G_OBJECT(picture), "thumbnail-bound-item", item);
     if (prev != item) {
         g_signal_connect(item, "notify::paintable", G_CALLBACK(on_item_paintable_notify), picture);
-    }
+        g_object_weak_ref(G_OBJECT(item), (GWeakNotify)on_item_destroyed, picture);
+    } 
 
     /* Trigger load with a small debounce to avoid bursts during fast scrolling.
        Use a longer delay for videos so we only generate video thumbnails after
@@ -596,7 +620,10 @@ unbind_list_item(GtkSignalListItemFactory *factory, GtkListItem *list_item, gpoi
                 /* Also disconnect any leftover notify handler for this picture on the item */
                 ThumbnailItem *item = gtk_list_item_get_item(list_item);
                 if (item) {
-                    g_signal_handlers_disconnect_by_func(item, on_item_paintable_notify, picture);
+                    if (G_IS_OBJECT(item)) {
+                        g_signal_handlers_disconnect_by_func(item, on_item_paintable_notify, picture);
+                        g_object_weak_unref(G_OBJECT(item), (GWeakNotify)on_item_destroyed, picture);
+                    }
                 }
             }
         }
