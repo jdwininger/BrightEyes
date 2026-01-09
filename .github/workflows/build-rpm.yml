@@ -59,6 +59,12 @@ jobs:
             mv *.rpm artifacts/ || true
             ls -l artifacts || true
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: brighteyes-rpm
+          path: artifacts/*.rpm
+
       - name: Upload RPM to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2

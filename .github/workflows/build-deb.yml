@@ -66,6 +66,12 @@ jobs:
           mkdir -p artifacts
           mv *.deb artifacts/
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: brighteyes-deb
+          path: artifacts/*.deb
+
       - name: Upload DEB to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
