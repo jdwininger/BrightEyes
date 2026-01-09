@@ -37,7 +37,7 @@ jobs:
             # Build project
             ls -la
             rm -rf build || true
-            meson setup build .
+            meson setup build
             meson compile -C build
 
             # Stage install into a temporary root
