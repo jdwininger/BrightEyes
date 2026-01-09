@@ -23,7 +23,7 @@ jobs:
         uses: addnab/docker-run-action@v3
         with:
           image: fedora:latest
-          options: --rm -v ${{ github.workspace }}:/workspace
+          options: --rm -v ${{ github.workspace }}:/workspace:z
           workdir: /workspace
           run: |
             set -euo pipefail
@@ -35,7 +35,9 @@ jobs:
             gem install --no-document fpm
 
             # Build project
-            meson setup build
+            ls -la
+            rm -rf build || true
+            meson setup build .
             meson compile -C build
 
             # Stage install into a temporary root
@@ -57,7 +59,7 @@ jobs:
 
       - name: Upload RPM to Release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*.rpm
         env:

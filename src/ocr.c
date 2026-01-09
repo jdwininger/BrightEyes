@@ -1,7 +1,15 @@
 #include "ocr.h"
 #include <glib.h>
 #include <gio/gio.h>
-#include <tesseract/capi.h>
+#ifdef __has_include
+#  if __has_include(<tesseract/capi.h>)
+#    include <tesseract/capi.h>
+#  else
+#    include <capi.h>
+#  endif
+#else
+#  include <tesseract/capi.h>
+#endif
 #include <leptonica/allheaders.h>
 
 /* OCR (Tesseract) helpers
