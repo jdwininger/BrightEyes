@@ -9,6 +9,8 @@ jobs:
   build-rpm:
     name: Build RPM (Fedora container)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,9 +30,8 @@ jobs:
             dnf -y update
             # Install build deps and packaging tools, including GStreamer devel packages
             dnf -y install meson ninja gcc pkgconfig gtk4-devel libadwaita-devel gdk-pixbuf2-devel \
-              gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good-devel \
-              gstreamer1-plugins-bad-free-devel gstreamer1-plugins-ugly gstreamer1-libav gstreamer1-libav-devel \
-              tesseract-devel lept-devel rpm-build ruby rubygems make which
+              gstreamer1-devel gstreamer1-plugins-base-devel \
+              tesseract-devel leptonica-devel rpm-build ruby rubygems make which
             gem install --no-document fpm
 
             # Build project
