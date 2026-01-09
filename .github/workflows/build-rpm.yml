@@ -23,10 +23,12 @@ jobs:
         uses: addnab/docker-run-action@v3
         with:
           image: fedora:latest
-          options: --rm -v ${{ github.workspace }}:/workspace:z
+          options: --rm -v ${{ github.workspace }}:/workspace
           workdir: /workspace
           run: |
             set -euo pipefail
+            git config --global --add safe.directory /workspace
+            cd /workspace
             dnf -y update
             # Install build deps and packaging tools, including GStreamer devel packages
             dnf -y install meson ninja gcc pkgconfig gtk4-devel libadwaita-devel gdk-pixbuf2-devel \
@@ -37,7 +39,7 @@ jobs:
             # Build project
             ls -la
             rm -rf build || true
-            meson setup build
+            meson setup build .
             meson compile -C build
 
             # Stage install into a temporary root
