@@ -1,0 +1,73 @@
+name: Build DEB and attach to Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch: {}
+
+jobs:
+  build-deb:
+    name: Build DEB (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version from tag
+        run: |
+          # Use tag name, branch name, or short SHA as fallback
+          TAG="${{ github.event.release.tag_name }}"
+          REF="${{ github.ref_name }}"
+          SHA="${{ github.sha }}"
+          VER="${TAG:-$REF}"
+          VER="${VER:-$SHA}"
+          # Strip 'v' prefix if present
+          VER="${VER#v}"
+          echo "VERSION=$VER" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build build-essential \
+            libgtk-4-dev libadwaita-1-dev libgdk-pixbuf-2.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            libtesseract-dev libleptonica-dev \
+            ruby-full
+
+          sudo gem install --no-document fpm
+
+      - name: Build and Install to staging
+        run: |
+          meson setup build --prefix=/usr
+          meson compile -C build
+          
+          # Stage install
+          mkdir -p /tmp/package
+          meson install -C build --destdir=/tmp/package
+
+      - name: Package DEB
+        run: |
+          fpm -s dir -t deb -n brighteyes -v "$VERSION" --license MIT \
+            --url "https://github.com/jdwininger/BrightEyes" \
+            --description "BrightEyes image/video viewer" \
+            --maintainer "Jeremy <jeremy@example.com>" \
+            --vendor "jdwininger" \
+            --depends "libgtk-4-1" \
+            --depends "libadwaita-1-0" \
+            --depends "libgstreamer1.0-0" \
+            --depends "libgstreamer-plugins-base1.0-0" \
+            --depends "libtesseract5" \
+            --depends "libleptonica6" \
+            -C /tmp/package .
+            
+          mkdir -p artifacts
+          mv *.deb artifacts/
+
+      - name: Upload DEB to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
