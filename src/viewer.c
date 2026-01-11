@@ -91,6 +91,12 @@ struct _Viewer {
      * load completion overrides a later user/programmatic fit toggle. */
     guint64 load_start_time;
     guint64 last_user_fit_time;
+
+    /* Optional debug/repro hooks enabled by environment variables. Disabled
+     * by default; set BRIGHTEYES_DEBUG_LOAD_RACE=1 to enable verbose repro logging
+     * and BRIGHTEYES_RUN_LOAD_RACE_TEST=1 to run a small deterministic self-test
+     * at startup that simulates the race and prints results. */
+    gboolean debug_repro_enabled;
 };
 
 /* scroll_timeout_cb removed: unused while scroll-wheel zoom is disabled. */
@@ -116,6 +122,7 @@ static void viewer_update_image(Viewer *self);
 static double get_fit_zoom_level(Viewer *self);
 static double get_fit_width_zoom(Viewer *self);
 static void viewer_set_zoom_level_internal(Viewer *self, double target_scale, gboolean center);
+static gboolean run_load_race_test_cb(gpointer user_data);
 
 /* Animation helpers */
 /* Animation helpers removed. */
@@ -316,7 +323,12 @@ viewer_init(Viewer *self)
 
     /* Initialize monotonic timestamps */
     self->load_start_time = 0;
-    self->last_user_fit_time = 0; 
+    self->last_user_fit_time = 0;
+
+    /* Debug/repro flags (disabled by default). Enable via env: BRIGHTEYES_DEBUG_LOAD_RACE=1
+     * to get extra logs, and BRIGHTEYES_RUN_LOAD_RACE_TEST=1 to run a deterministic
+     * self-test at startup that simulates the load-vs-user-fit race. */
+    self->debug_repro_enabled = g_getenv("BRIGHTEYES_DEBUG_LOAD_RACE") != NULL; 
 
     /* Start with full volume by default */
     self->saved_volume = 1.0;
@@ -424,6 +436,14 @@ viewer_init(Viewer *self)
     gtk_widget_set_margin_top(self->debug_label, 8);
     gtk_overlay_add_overlay(self->overlay, self->debug_label);
     gtk_widget_set_visible(self->debug_label, FALSE);
+
+    /* If requested, schedule the deterministic self-test that simulates the
+     * load-vs-user-fit race. */
+    if (g_getenv("BRIGHTEYES_RUN_LOAD_RACE_TEST")) {
+        g_warning("BRIGHTEYES_RUN_LOAD_RACE_TEST set: scheduling load-race self-test (logs at warning level)");
+        g_object_ref(self); /* keep alive for the idle callback */
+        g_idle_add(run_load_race_test_cb, self);
+    }
 
     /* Gesture for selection (click-drag on picture) */
     GtkGesture *g1 = gtk_gesture_drag_new();
@@ -640,6 +660,66 @@ viewer_is_playing(Viewer *self)
     return state == GST_STATE_PLAYING;
 }
 
+/* Internal helper that applies a loaded pixbuf to the viewer. Factored out
+ * so tests can call it deterministically. */
+static void
+handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf)
+{
+    /* Replace stored pixbuf with the newly loaded one and invalidate cached textures */
+    g_clear_object(&self->original_pixbuf);
+    g_clear_object(&self->original_texture);
+    g_clear_object(&self->preview_texture);
+    self->original_texture_rotation_angle = -1;
+
+    /* Take ownership of the loaded pixbuf */
+    self->original_pixbuf = pixbuf;
+
+    self->zoom_level = 1.0;
+    self->rotation_angle = 0;
+
+    if (self->debug_repro_enabled) {
+        g_warning("handle_loaded_pixbuf: load_start_time=%" G_GUINT64_FORMAT " last_user_fit_time=%" G_GUINT64_FORMAT,
+                  self->load_start_time, self->last_user_fit_time);
+    }
+
+    /* Preserve fit-to-width across page loads (e.g. comics) UNLESS the fit
+     * mode was changed after this load began. In that case we should not
+     * override the newer user/programmatic choice. */
+    if (self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time) {
+        if (self->debug_repro_enabled) {
+            g_warning("handle_loaded_pixbuf: skipping override because last_user_fit_time=%" G_GUINT64_FORMAT " > load_start_time=%" G_GUINT64_FORMAT,
+                      self->last_user_fit_time, self->load_start_time);
+        } else {
+            g_debug("handle_loaded_pixbuf: not overriding fit (user changed fit after load started)");
+        }
+    } else {
+        self->fit_to_window = self->fit_to_width ? FALSE : self->default_fit;
+    }
+
+    /* Update the image now that we have a pixbuf */
+    viewer_update_image(self);
+
+    /* Reset vertical scroll to the top of the new page so users start at the
+     * top when switching pages, but only if a newer fit change didn't happen
+     * after this load started (that change should take precedence). */
+    if (!(self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time)) {
+        GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+        if (vadj) {
+            gtk_adjustment_set_value(vadj, 0.0);
+            self->has_pending_center = FALSE;
+        }
+    } else {
+        if (self->debug_repro_enabled) {
+            g_warning("handle_loaded_pixbuf: preserving user viewport/centering after a later fit toggle");
+        } else {
+            g_debug("on_pixbuf_loaded: preserving user viewport/centering after a later fit toggle");
+        }
+    }
+
+    const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
+    gtk_stack_set_visible_child_name(GTK_STACK(self->image_stack), view_name);
+}
+
 static void
 on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
 {
@@ -668,47 +748,47 @@ on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
        So checking G_IO_ERROR_CANCELLED is sufficient.
     */
 
-    /* Replace stored pixbuf with the newly loaded one and invalidate cached textures */
-    g_clear_object(&self->original_pixbuf);
-    g_clear_object(&self->original_texture);
-    g_clear_object(&self->preview_texture);
-    self->original_texture_rotation_angle = -1;
+    /* Hand off the loaded pixbuf to the common handler */
+    handle_loaded_pixbuf(self, pixbuf);
 
-    /* Take ownership of the loaded pixbuf */
-    self->original_pixbuf = pixbuf;
-
-    self->zoom_level = 1.0;
-    self->rotation_angle = 0;
-
-    /* Preserve fit-to-width across page loads (e.g. comics) UNLESS the fit
-     * mode was changed after this load began. In that case we should not
-     * override the newer user/programmatic choice. */
-    if (self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time) {
-        g_debug("on_pixbuf_loaded: not overriding fit (user changed fit after load started)");
-    } else {
-        self->fit_to_window = self->fit_to_width ? FALSE : self->default_fit;
-    }
-
-    /* Update the image now that we have a pixbuf */
-    viewer_update_image(self);
-
-    /* Reset vertical scroll to the top of the new page so users start at the
-     * top when switching pages, but only if a newer fit change didn't happen
-     * after this load started (that change should take precedence). */
-    if (!(self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time)) {
-        GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
-        if (vadj) {
-            gtk_adjustment_set_value(vadj, 0.0);
-            self->has_pending_center = FALSE;
-        }
-    } else {
-        g_debug("on_pixbuf_loaded: preserving user viewport/centering after a later fit toggle");
-    }
-
-    const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
-    gtk_stack_set_visible_child_name(GTK_STACK(self->image_stack), view_name);
-    
     g_object_unref(self);
+}
+
+/* Deterministic self-test to simulate the race between a load and a later
+ * user fit change. This runs only when BRIGHTEYES_RUN_LOAD_RACE_TEST=1 is in
+ * the environment. It will log results (at warning level) so it's easy to
+ * observe from the terminal for debugging purposes. */
+static gboolean
+run_load_race_test_cb(gpointer user_data)
+{
+    Viewer *self = VIEWER(user_data);
+
+    g_warning("--- BRIGHTEYES LOAD-RACE SELF-TEST START ---");
+
+    /* Case 1: last_user_fit_time occurs AFTER load_start_time -> override should NOT happen */
+    self->load_start_time = (guint64)g_get_monotonic_time();
+    self->last_user_fit_time = self->load_start_time + 1000; /* simulate user action after load start */
+
+    GdkPixbuf *test_pix1 = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, 1, 1);
+    gdk_pixbuf_fill(test_pix1, 0xffffffff);
+    handle_loaded_pixbuf(self, test_pix1);
+    g_warning("TEST CASE 1: last_user_fit_time > load_start_time => fit override should be skipped");
+
+    /* Case 2: last_user_fit_time occurs BEFORE load_start_time -> override should happen */
+    self->load_start_time = (guint64)g_get_monotonic_time();
+    self->last_user_fit_time = self->load_start_time - 1000; /* user action before load start */
+
+    GdkPixbuf *test_pix2 = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, 1, 1);
+    gdk_pixbuf_fill(test_pix2, 0xffffffff);
+    handle_loaded_pixbuf(self, test_pix2);
+    g_warning("TEST CASE 2: last_user_fit_time < load_start_time => fit override should be applied");
+
+    g_warning("--- BRIGHTEYES LOAD-RACE SELF-TEST END ---");
+
+    /* Release the ref we took when scheduling the test */
+    g_object_unref(self);
+
+    return G_SOURCE_REMOVE;
 }
 
 static void
@@ -1557,6 +1637,10 @@ void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
     /* Record when fit mode was changed so a concurrent load completion cannot
      * later override this user/programmatic change. */
     self->last_user_fit_time = (guint64)g_get_monotonic_time();
+    if (self->debug_repro_enabled) {
+        g_warning("viewer_set_fit_to_window: recorded last_user_fit_time=%" G_GUINT64_FORMAT " load_start_time=%" G_GUINT64_FORMAT,
+                  self->last_user_fit_time, self->load_start_time);
+    }
     self->fit_to_window = fit ? TRUE : FALSE; 
     if (fit) {
         self->fit_to_width = FALSE;
@@ -1581,6 +1665,10 @@ void viewer_set_fit_to_width(Viewer *self) {
     /* Record when fit mode was changed so a concurrent load completion cannot
      * later override this user/programmatic change. */
     self->last_user_fit_time = (guint64)g_get_monotonic_time();
+    if (self->debug_repro_enabled) {
+        g_warning("viewer_set_fit_to_width: recorded last_user_fit_time=%" G_GUINT64_FORMAT " load_start_time=%" G_GUINT64_FORMAT,
+                  self->last_user_fit_time, self->load_start_time);
+    }
     /* Fit image width to the *visible viewport* width, preserving aspect ratio.
      * We also preserve the current viewport center to avoid jumping to (0,0).
      */
