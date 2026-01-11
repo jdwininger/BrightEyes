@@ -87,6 +87,10 @@ struct _Viewer {
     double scroll_accumulator;
     guint scroll_timeout_id;
     GCancellable *load_cancellable;
+    /* Monotonic timestamps (microseconds) to avoid races where an in-flight
+     * load completion overrides a later user/programmatic fit toggle. */
+    guint64 load_start_time;
+    guint64 last_user_fit_time;
 };
 
 /* scroll_timeout_cb removed: unused while scroll-wheel zoom is disabled. */
@@ -309,6 +313,10 @@ viewer_init(Viewer *self)
     /* animation pipeline removed; no animation state */
     self->original_texture = NULL;
     self->original_texture_rotation_angle = -1;
+
+    /* Initialize monotonic timestamps */
+    self->load_start_time = 0;
+    self->last_user_fit_time = 0; 
 
     /* Start with full volume by default */
     self->saved_volume = 1.0;
@@ -671,21 +679,30 @@ on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
 
     self->zoom_level = 1.0;
     self->rotation_angle = 0;
-    /* Preserve fit-to-width across page loads (e.g. comics). */
-    self->fit_to_window = self->fit_to_width ? FALSE : self->default_fit;
+
+    /* Preserve fit-to-width across page loads (e.g. comics) UNLESS the fit
+     * mode was changed after this load began. In that case we should not
+     * override the newer user/programmatic choice. */
+    if (self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time) {
+        g_debug("on_pixbuf_loaded: not overriding fit (user changed fit after load started)");
+    } else {
+        self->fit_to_window = self->fit_to_width ? FALSE : self->default_fit;
+    }
 
     /* Update the image now that we have a pixbuf */
     viewer_update_image(self);
 
     /* Reset vertical scroll to the top of the new page so users start at the
-     * top when switching pages. This is applied immediately; if layout has not
-     * fully settled yet, our idle-based centering logic will not override it
-     * because we clear pending center state on new loads.
-     */
-    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
-    if (vadj) {
-        gtk_adjustment_set_value(vadj, 0.0);
-        self->has_pending_center = FALSE;
+     * top when switching pages, but only if a newer fit change didn't happen
+     * after this load started (that change should take precedence). */
+    if (!(self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time)) {
+        GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+        if (vadj) {
+            gtk_adjustment_set_value(vadj, 0.0);
+            self->has_pending_center = FALSE;
+        }
+    } else {
+        g_debug("on_pixbuf_loaded: preserving user viewport/centering after a later fit toggle");
     }
 
     const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
@@ -771,6 +788,10 @@ viewer_load_file(Viewer *self, const char *path)
         g_clear_object(&self->load_cancellable);
     }
     self->load_cancellable = g_cancellable_new();
+    /* Record load start time so we can avoid races where a user toggles fit mode
+     * while an async load is in-flight and then the load completion overrides
+     * the user's explicit choice. Uses monotonic microsecond timestamp. */
+    self->load_start_time = (guint64)g_get_monotonic_time();
 
     /* Reset selection mode and clear selection on file change */
     self->selection_mode = FALSE;
@@ -1533,7 +1554,10 @@ void viewer_zoom_out(Viewer *self) {
 
 void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
     g_debug("viewer_set_fit_to_window called: fit=%d (was fit_to_width=%d fit_to_window=%d)", (int)fit, (int)self->fit_to_width, (int)self->fit_to_window);
-    self->fit_to_window = fit ? TRUE : FALSE;
+    /* Record when fit mode was changed so a concurrent load completion cannot
+     * later override this user/programmatic change. */
+    self->last_user_fit_time = (guint64)g_get_monotonic_time();
+    self->fit_to_window = fit ? TRUE : FALSE; 
     if (fit) {
         self->fit_to_width = FALSE;
         /* Clear any pending center since fit-to-window will center explicitly */
@@ -1554,6 +1578,9 @@ void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
 
 void viewer_set_fit_to_width(Viewer *self) {
     g_debug("viewer_set_fit_to_width called (before fit_to_width=%d fit_to_window=%d)", (int)self->fit_to_width, (int)self->fit_to_window);
+    /* Record when fit mode was changed so a concurrent load completion cannot
+     * later override this user/programmatic change. */
+    self->last_user_fit_time = (guint64)g_get_monotonic_time();
     /* Fit image width to the *visible viewport* width, preserving aspect ratio.
      * We also preserve the current viewport center to avoid jumping to (0,0).
      */
