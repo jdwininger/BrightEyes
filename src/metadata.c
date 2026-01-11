@@ -2,6 +2,7 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib/gstdio.h>
 #include <adwaita.h>
+#include "archive.h"
 
 /* Metadata sidebar utilities
  *
@@ -150,58 +151,135 @@ metadata_sidebar_update(GtkWidget *sidebar, const char *path)
     adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(file_group), "File Details");
     gtk_box_append(GTK_BOX(box), file_group);
 
-    GFile *file = g_file_new_for_path(path);
-    GError *error = NULL;
-    GFileInfo *info = g_file_query_info(file, "standard::*,time::*", G_FILE_QUERY_INFO_NONE, NULL, &error);
+    if (g_str_has_prefix(path, "archive://")) {
+        /* Parse archive://<archive_path>::<entry> */
+        const char *sep = strstr(path, "::");
+        if (sep) {
+            size_t archive_len = sep - (path + strlen("archive://"));
+            char *archive_path = g_strndup(path + strlen("archive://"), archive_len);
+            char *entry_name = g_strdup(sep + 2);
 
-    if (info) {
-        char *dirname = g_path_get_dirname(path);
-        add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Location", dirname);
-        g_free(dirname);
-        
-        add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Name", g_file_info_get_display_name(info));
-        
-        char *size_str = format_size(g_file_info_get_size(info));
-        add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Size", size_str);
-        g_free(size_str);
+            char *dirname = g_path_get_dirname(archive_path);
+            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Archive", dirname);
+            g_free(dirname);
 
-        const char *content_type = g_file_info_get_content_type(info);
-        if (content_type) {
-             char *desc = g_content_type_get_description(content_type);
-             add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Type", desc ? desc : content_type);
-             g_free(desc);
-        }
-        
-        GDateTime *cdt = g_file_info_get_creation_date_time(info);
-        if (cdt) {
-            char *cdate_str = g_date_time_format(cdt, "%Y-%m-%d %H:%M");
-            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Created", cdate_str);
-            g_free(cdate_str);
-            g_date_time_unref(cdt);
-        }
+            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Entry", entry_name);
 
-        GDateTime *dt = g_file_info_get_modification_date_time(info);
-        if (dt) {
-            char *date_str = g_date_time_format(dt, "%Y-%m-%d %H:%M");
-            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Modified", date_str);
-            g_free(date_str);
-            g_date_time_unref(dt);
+            GError *err = NULL;
+            guint64 esize = 0;
+            if (archive_get_entry_size(archive_path, entry_name, &esize, &err)) {
+                char *size_str = format_size(esize);
+                add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Size", size_str);
+                g_free(size_str);
+            } else {
+                if (err) {
+                    add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Archive Error", err->message);
+                    g_clear_error(&err);
+                }
+            }
+
+            g_free(archive_path);
+            g_free(entry_name);
+        } else {
+            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Archive", "Invalid archive path");
         }
-        g_object_unref(info);
     } else {
-         add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Error", "Could not query file info");
-         if (error) {
-             add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Message", error->message);
-             g_clear_error(&error);
-         }
-    }
-    g_object_unref(file);
+        GFile *file = g_file_new_for_path(path);
+        GError *error = NULL;
+        GFileInfo *info = g_file_query_info(file, "standard::*,time::*", G_FILE_QUERY_INFO_NONE, NULL, &error);
 
+        if (info) {
+            char *dirname = g_path_get_dirname(path);
+            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Location", dirname);
+            g_free(dirname);
+            
+            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Name", g_file_info_get_display_name(info));
+            
+            char *size_str = format_size(g_file_info_get_size(info));
+            add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Size", size_str);
+            g_free(size_str);
+
+            const char *content_type = g_file_info_get_content_type(info);
+            if (content_type) {
+                 char *desc = g_content_type_get_description(content_type);
+                 add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Type", desc ? desc : content_type);
+                 g_free(desc);
+            }
+            
+            GDateTime *cdt = g_file_info_get_creation_date_time(info);
+            if (cdt) {
+                char *cdate_str = g_date_time_format(cdt, "%Y-%m-%d %H:%M");
+                add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Created", cdate_str);
+                g_free(cdate_str);
+                g_date_time_unref(cdt);
+            }
+
+            GDateTime *dt = g_file_info_get_modification_date_time(info);
+            if (dt) {
+                char *date_str = g_date_time_format(dt, "%Y-%m-%d %H:%M");
+                add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Modified", date_str);
+                g_free(date_str);
+                g_date_time_unref(dt);
+            }
+            g_object_unref(info);
+        } else {
+             add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Error", "Could not query file info");
+             if (error) {
+                 add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Message", error->message);
+                 g_clear_error(&error);
+             }
+        }
+        g_object_unref(file);
+    }
     /* Image Properties Group */
-    int width, height;
-    GdkPixbufFormat *format_info = gdk_pixbuf_get_file_info(path, &width, &height);
-    
-    if (format_info) {
+    /* Image properties: handle archive virtual paths specially */
+    int width = 0, height = 0;
+    gchar *fmt_name = NULL;
+
+    if (g_str_has_prefix(path, "archive://")) {
+        const char *sep = strstr(path, "::");
+        if (sep) {
+            size_t archive_len = sep - (path + strlen("archive://"));
+            char *archive_path = g_strndup(path + strlen("archive://"), archive_len);
+            char *entry_name = g_strdup(sep + 2);
+
+            GError *err = NULL;
+            GBytes *bytes = archive_read_entry_bytes(archive_path, entry_name, &err);
+            if (bytes) {
+                gsize bsize = g_bytes_get_size(bytes);
+                const guint8 *data = g_bytes_get_data(bytes, NULL);
+                guint8 *copy = g_malloc(bsize);
+                memcpy(copy, data, bsize);
+                GInputStream *mem = g_memory_input_stream_new_from_data(copy, (gssize)bsize, g_free);
+
+                GError *perr = NULL;
+                GdkPixbuf *pix = gdk_pixbuf_new_from_stream(G_INPUT_STREAM(mem), NULL, &perr);
+                if (pix) {
+                    width = gdk_pixbuf_get_width(pix);
+                    height = gdk_pixbuf_get_height(pix);
+                    fmt_name = g_strdup("image (in archive)");
+                    g_object_unref(pix);
+                } else {
+                    if (perr) g_clear_error(&perr);
+                }
+                g_object_unref(mem);
+                g_bytes_unref(bytes);
+            } else if (err) {
+                add_pref_row(ADW_PREFERENCES_GROUP(file_group), "Image Error", err->message);
+                g_clear_error(&err);
+            }
+
+            g_free(archive_path);
+            g_free(entry_name);
+        }
+    } else {
+        GdkPixbufFormat *format_info = gdk_pixbuf_get_file_info(path, &width, &height);
+        if (format_info) {
+            fmt_name = gdk_pixbuf_format_get_name(format_info);
+        }
+    }
+
+    if (width > 0 && height > 0) {
         GtkWidget *img_group = adw_preferences_group_new();
         adw_preferences_group_set_title(ADW_PREFERENCES_GROUP(img_group), "Image Properties");
         gtk_box_append(GTK_BOX(box), img_group);
@@ -209,11 +287,10 @@ metadata_sidebar_update(GtkWidget *sidebar, const char *path)
         char *dim = g_strdup_printf("%d × %d", width, height);
         add_pref_row(ADW_PREFERENCES_GROUP(img_group), "Dimensions", dim);
         g_free(dim);
-        
-        gchar *name = gdk_pixbuf_format_get_name(format_info);
-        if (name) {
-             add_pref_row(ADW_PREFERENCES_GROUP(img_group), "Format", name);
-             g_free(name);
+
+        if (fmt_name) {
+             add_pref_row(ADW_PREFERENCES_GROUP(img_group), "Format", fmt_name);
+             g_free(fmt_name);
         }
     }
 }

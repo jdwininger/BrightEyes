@@ -29,6 +29,14 @@ Minimal documentation is available in the `docs/` directory and will be publishe
 
 License: GPLv3
 
+## 📦 Archive support (CBZ/CBR)
+
+- CBZ (ZIP-based comic book) and CBR (RAR-based) support are available when building with libarchive present on the system (pkg-config name: `libarchive`).
+- On many distributions install `libarchive` development package (e.g., `libarchive-dev` or `libarchive-devel`) and Meson will detect it automatically.
+- If libarchive is unavailable the application will still build and run but archives will not be enumerated.
+
+Note: RAR/CBR support depends on libarchive's available RAR support which can vary by platform and libarchive build configuration.
+
 ## Publishing
 
 - GitHub Releases: RPM and DEB artifacts are attached by CI.

@@ -13,6 +13,9 @@ gdkpixbuf_dep = dependency('gdk-pixbuf-2.0', required: true)
 tesseract_dep = dependency('tesseract', required : false)
 lept_dep = dependency('lept', required : false)
 
+# Optional archive support (libarchive) for CBZ/CBR
+libarchive_dep = dependency('libarchive', required: false)
+
 gst_dep = dependency('gstreamer-1.0', required: false)
 gstvideo_dep = dependency('gstreamer-video-1.0', required: false)
 
@@ -29,11 +32,22 @@ sources = files(
   'src/window.c',
   'src/thumbnails.c',
   'src/metadata.c',
-  'src/ocr.c'
+  'src/ocr.c',
+  'src/archive.c'
 )
 
+# If libarchive is available, expose a compile-time define to enable archive code
+deps = [gtk_dep, adwaita_dep, gdkpixbuf_dep, gst_dep, gstvideo_dep, tesseract_dep, lept_dep]
+if libarchive_dep.found()
+  deps += libarchive_dep
+  add_project_arguments('-DHAVE_LIBARCHIVE', language : 'c')
+endif
+
+# Ensure math library is linked for functions like exp()
+add_project_link_arguments('-lm', language : 'c')
+
 executable('brighteyes', sources + resources,
-  dependencies : [gtk_dep, adwaita_dep, gdkpixbuf_dep, gst_dep, gstvideo_dep, tesseract_dep, lept_dep],
+  dependencies : deps,
   install : true
 )
 

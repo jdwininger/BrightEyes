@@ -28,6 +28,12 @@ jobs:
           mkdir -p flatpak-build
           flatpak-builder --force-clean --repo=repo flatpak-build org.jeremy.BrightEyes.yml
 
+      - name: Smoke test GStreamer plugins inside build
+        run: |
+          set -eux
+          # Verify gst-inspect sees libav and other plugins inside the build
+          flatpak-builder --run flatpak-build org.jeremy.BrightEyes.yml gst-inspect-1.0 | grep -i libav
+
       - name: Make Flatpak bundle
         env:
           VERSION: ${{ github.event.release.tag_name || github.ref_name || github.sha }}

@@ -14,6 +14,8 @@
 #include "thumbnails.h"
 #include "metadata.h"
 #include "ocr.h"
+#include "archive.h"
+#include <gio/gio.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -49,11 +51,13 @@ struct _BrightEyesWindow {
     /* Buttons we may disable during video playback */
     GtkWidget *zoom_out_btn;
     GtkWidget *zoom_in_btn;
-    GtkWidget *fit_btn;
+    GtkWidget *fit_window_btn;
+    GtkWidget *fit_width_btn;
     GtkWidget *rot_left_btn;
     GtkWidget *rot_right_btn;
 
     /* Config */
+    GSimpleActionGroup *win_actions;
     GAppInfo *selected_editor;
     GList *editor_candidates; /* List of GAppInfo* */
 
@@ -267,25 +271,55 @@ on_playback_changed(Viewer *viewer, gboolean playing, BrightEyesWindow *self)
     gboolean enabled = !playing;
     if (self->zoom_in_btn) gtk_widget_set_sensitive(self->zoom_in_btn, enabled);
     if (self->zoom_out_btn) gtk_widget_set_sensitive(self->zoom_out_btn, enabled);
-    if (self->fit_btn) gtk_widget_set_sensitive(self->fit_btn, enabled);
+    if (self->fit_window_btn) gtk_widget_set_sensitive(self->fit_window_btn, enabled);
+    if (self->fit_width_btn) gtk_widget_set_sensitive(self->fit_width_btn, enabled);
     if (self->rot_left_btn) gtk_widget_set_sensitive(self->rot_left_btn, enabled);
     if (self->rot_right_btn) gtk_widget_set_sensitive(self->rot_right_btn, enabled);
+}
+
+static void
+update_zoom_ui_for_file_type(BrightEyesWindow *self, const char *path)
+{
+    gboolean is_comic = (path && g_str_has_prefix(path, "archive://"));
+    
+    gtk_widget_set_visible(self->zoom_in_btn, !is_comic);
+    gtk_widget_set_visible(self->zoom_out_btn, !is_comic);
+    
+    /* Ensure fit buttons are visible (they are always relevant) */
+    gtk_widget_set_visible(self->fit_window_btn, TRUE);
+    gtk_widget_set_visible(self->fit_width_btn, TRUE);
 }
 
 /* Public method to open a file */
 void
 load_image_path(BrightEyesWindow *self, const char *path)
 {
+    update_zoom_ui_for_file_type(self, path);
     viewer_load_file(self->viewer, path);
-    /* Apply preferred default zoom mode */
-    if (self->default_fit_to_window)
-        viewer_set_fit_to_window(self->viewer, TRUE);
-    else
-        viewer_zoom_reset(self->viewer);
     update_title(self);
     
     /* Update metadata whenever an image is loaded */
     metadata_sidebar_update(self->metadata_sidebar, path);
+
+    /* Update actions */
+    gboolean can_convert = FALSE;
+    if (path && g_str_has_prefix(path, "archive://")) {
+        const char *sep = strstr(path, "::");
+        if (sep) {
+             size_t len = sep - (path + strlen("archive://"));
+             char *arch = g_strndup(path + strlen("archive://"), len);
+             if (!g_str_has_suffix(arch, ".cbz") && !g_str_has_suffix(arch, ".CBZ") &&
+                 !g_str_has_suffix(arch, ".zip") && !g_str_has_suffix(arch, ".ZIP")) {
+                 can_convert = TRUE;
+             }
+             g_free(arch);
+        }
+    }
+    
+    if (self->win_actions) {
+        GAction *act = g_action_map_lookup_action(G_ACTION_MAP(self->win_actions), "convert-to-cbz");
+        if (act) g_simple_action_set_enabled(G_SIMPLE_ACTION(act), can_convert);
+    }
 }
 
 static void
@@ -307,9 +341,15 @@ on_zoom_out_clicked(GtkButton *btn, BrightEyesWindow *self) {
 }
 
 static void
-on_fit_clicked(GtkButton *btn, BrightEyesWindow *self) {
+on_fit_window_clicked(GtkButton *btn, BrightEyesWindow *self) {
     viewer_set_fit_to_window(self->viewer, TRUE);
 }
+
+static void
+on_fit_width_clicked(GtkButton *btn, BrightEyesWindow *self) {
+    viewer_set_fit_to_width(self->viewer);
+}
+ 
 
 static void
 on_rotate_left_clicked(GtkButton *btn, BrightEyesWindow *self) {
@@ -1095,14 +1135,33 @@ on_window_key_pressed(GtkEventControllerKey *controller, guint keyval, guint key
         }
         case GDK_KEY_0:
         case GDK_KEY_KP_0:
-             if (state & GDK_CONTROL_MASK) viewer_zoom_reset(self->viewer);
-             return TRUE;
+             if (state & GDK_CONTROL_MASK) {
+                 viewer_zoom_reset(self->viewer);
+                 return TRUE;
+             }
+             break;
         case GDK_KEY_r:
              if (state & GDK_CONTROL_MASK) viewer_rotate_cw(self->viewer);
              return TRUE;
         case GDK_KEY_l:
              if (state & GDK_CONTROL_MASK) viewer_rotate_ccw(self->viewer);
              return TRUE;
+        case GDK_KEY_plus:
+        case GDK_KEY_KP_Add:
+             /* Only allow manual zoom if visible (not comic) */
+             if ((state & GDK_CONTROL_MASK) && gtk_widget_get_visible(self->zoom_in_btn)) {
+                 viewer_zoom_in(self->viewer); 
+                 return TRUE; 
+             }
+             break;
+        case GDK_KEY_minus:
+        case GDK_KEY_KP_Subtract:
+             /* Only allow manual zoom if visible (not comic) */
+             if ((state & GDK_CONTROL_MASK) && gtk_widget_get_visible(self->zoom_out_btn)) { 
+                 viewer_zoom_out(self->viewer); 
+                 return TRUE; 
+             }
+             break;
         case GDK_KEY_F11:
         {
              if (gtk_window_is_fullscreen(GTK_WINDOW(self)))
@@ -1145,11 +1204,55 @@ on_open_editor_action(GSimpleAction *action, GVariant *parameter, gpointer user_
     const char *current_file = curator_get_current(self->curator);
     
     if (!current_file) return;
-    
-    GFile *file = g_file_new_for_path(current_file);
-    GList *files = g_list_append(NULL, file);
+
+    GList *files = NULL;
     GError *error = NULL;
-    
+
+    if (g_str_has_prefix(current_file, "archive://")) {
+        /* Extract entry to a temporary file and open that */
+        const char *sep = strstr(current_file, "::");
+        if (sep) {
+            size_t archive_len = sep - (current_file + strlen("archive://"));
+            char *archive_path = g_strndup(current_file + strlen("archive://"), archive_len);
+            char *entry_name = g_strdup(sep + 2);
+
+            GBytes *bytes = archive_read_entry_bytes(archive_path, entry_name, &error);
+            if (bytes) {
+                GError *e2 = NULL;
+                char *tmpdir_template = g_strdup_printf("%s/brighteyes-XXXXXX", g_get_tmp_dir());
+                char *tmpdir = g_mkdtemp(tmpdir_template);
+                if (tmpdir) {
+                    char *basename = g_path_get_basename(entry_name);
+                    char *tmp_path = g_build_filename(tmpdir, basename, NULL);
+                    GFile *tmpfile = g_file_new_for_path(tmp_path);
+                    if (g_file_replace_contents(tmpfile, (const char *)g_bytes_get_data(bytes, NULL), g_bytes_get_size(bytes), NULL, FALSE, G_FILE_CREATE_REPLACE_DESTINATION, NULL, NULL, &e2)) {
+                        files = g_list_append(files, tmpfile);
+                    } else {
+                        g_warning("Failed to write temp file: %s", e2 ? e2->message : "unknown");
+                        g_clear_error(&e2);
+                        g_object_unref(tmpfile);
+                    }
+                    g_free(basename);
+                    g_free(tmp_path);
+                } else {
+                    g_warning("Failed to create temporary directory");
+                }
+                g_free(tmpdir_template);
+                g_bytes_unref(bytes);
+            } else {
+                /* error is set by archive_read_entry_bytes */
+            }
+
+            g_free(archive_path);
+            g_free(entry_name);
+        }
+    } else {
+        GFile *file = g_file_new_for_path(current_file);
+        files = g_list_append(files, file);
+    }
+
+    if (!files) return;
+
     if (self->selected_editor) {
         g_app_info_launch(self->selected_editor, files, NULL, &error);
     } else {
@@ -1160,9 +1263,12 @@ on_open_editor_action(GSimpleAction *action, GVariant *parameter, gpointer user_
         
         /* If we are the default, this might loop. 
            But let's assume the user wants the system default if they haven't picked one. */
-        char *uri = g_file_get_uri(file);
-        g_app_info_launch_default_for_uri(uri, NULL, &error);
-        g_free(uri);
+        GFile *first = g_list_nth_data(files, 0);
+        if (first) {
+            char *uri = g_file_get_uri(first);
+            g_app_info_launch_default_for_uri(uri, NULL, &error);
+            g_free(uri);
+        }
     }
     
     if (error) {
@@ -1170,8 +1276,139 @@ on_open_editor_action(GSimpleAction *action, GVariant *parameter, gpointer user_
         g_clear_error(&error);
     }
     
+    /* Cleanup local file refs (we own the references we created) */
+    for (GList *it = files; it != NULL; it = it->next) {
+        GFile *f = it->data;
+        g_object_unref(f);
+    }
     g_list_free(files);
-    g_object_unref(file);
+}
+
+static void
+convert_cbz_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+{
+    char **paths = (char **)task_data;
+    const char *src = paths[0];
+    const char *dst = paths[1];
+    GError *error = NULL;
+
+    if (archive_convert_to_cbz(src, dst, &error)) {
+        g_task_return_boolean(task, TRUE);
+    } else {
+        g_task_return_error(task, error);
+    }
+}
+
+static void
+on_convert_cbz_finished(GObject *source_object, GAsyncResult *res, gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(source_object);
+    GError *error = NULL;
+
+    if (g_task_propagate_boolean(G_TASK(res), &error)) {
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Archive converted to CBZ"));
+    } else {
+        g_warning("Conversion failed: %s", error->message);
+        g_autofree char *msg = g_strdup_printf("Conversion failed: %s", error->message);
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+        g_error_free(error);
+    }
+}
+
+static void
+start_conversion_task(BrightEyesWindow *self, const char *path)
+{
+    /* Calculate destination */
+    char *dest_path = NULL;
+    
+    /* Determine if we are just replacing extension or appending */
+    const char *dot = strrchr(path, '.');
+    if (dot && g_ascii_strcasecmp(dot, ".cbr") == 0) {
+         char *tmp = g_strndup(path, dot - path);
+         dest_path = g_strdup_printf("%s.cbz", tmp);
+         g_free(tmp);
+    } else {
+         dest_path = g_strdup_printf("%s.cbz", path);
+    }
+
+    if (g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
+        g_autofree char *msg = g_strdup_printf("Destination already exists: %s", dest_path);
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+        g_free(dest_path);
+        return;
+    }
+
+    adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Converting archive..."));
+    
+    GTask *task = g_task_new(self, NULL, on_convert_cbz_finished, NULL);
+    char **paths = g_new(char *, 3);
+    paths[0] = g_strdup(path);
+    paths[1] = dest_path;
+    paths[2] = NULL;
+    g_task_set_task_data(task, paths, (GDestroyNotify)g_strfreev);
+    
+    g_task_run_in_thread(task, convert_cbz_thread);
+    g_object_unref(task);
+}
+
+static void
+on_cbr_prompt_response(AdwAlertDialog *dlg, const char *response, gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+    char *path = (char *)g_object_get_data(G_OBJECT(dlg), "target_path");
+    
+    if (g_strcmp0(response, "convert") == 0) {
+        start_conversion_task(self, path);
+    }
+}
+
+static void
+check_cbr_prompt(BrightEyesWindow *self, const char *path)
+{
+    /* Check extension */
+    const char *ext = strrchr(path, '.');
+    if (!ext) return;
+    
+    if (g_ascii_strcasecmp(ext, ".cbr") == 0) {
+        AdwAlertDialog *dlg = ADW_ALERT_DIALOG(adw_alert_dialog_new(
+            "Convert to CBZ?",
+            "This is a RAR (CBR) archive. Note: You cannot delete pages from CBR files. Would you like to convert it to Zip (CBZ) format?"
+        ));
+        adw_alert_dialog_add_response(dlg, "cancel", "Keep CBR");
+        adw_alert_dialog_add_response(dlg, "convert", "Convert");
+        adw_alert_dialog_set_response_appearance(dlg, "convert", ADW_RESPONSE_SUGGESTED);
+        
+        g_object_set_data_full(G_OBJECT(dlg), "target_path", g_strdup(path), g_free);
+        
+        g_signal_connect(dlg, "response", G_CALLBACK(on_cbr_prompt_response), self);
+        adw_dialog_present(ADW_DIALOG(dlg), GTK_WIDGET(self));
+    }
+}
+
+static void
+on_convert_to_cbz_action(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+    const char *current_file = curator_get_current(self->curator);
+    
+    if (!current_file) return;
+
+    char *archive_path = NULL;
+    if (g_str_has_prefix(current_file, "archive://")) {
+        const char *sep = strstr(current_file, "::");
+        if (sep) {
+            size_t len = sep - (current_file + strlen("archive://"));
+            archive_path = g_strndup(current_file + strlen("archive://"), len);
+        }
+    } else {
+        /* Not an archive we are inside */
+        return; 
+    }
+
+    if (!archive_path) return;
+
+    start_conversion_task(self, archive_path);
+    g_free(archive_path);
 }
 
 static char *
@@ -1658,6 +1895,7 @@ bright_eyes_window_dispose(GObject *object)
         g_signal_handlers_disconnect_by_data(self->thumbnails, self);
     }
 
+    g_clear_object(&self->win_actions);
     g_clear_object(&self->selected_editor);
     if (self->editor_candidates) {
         g_list_free_full(self->editor_candidates, g_object_unref);
@@ -1804,11 +2042,19 @@ bright_eyes_window_init(BrightEyesWindow *self)
     adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_in);
     self->zoom_in_btn = zoom_in;
     
-    GtkWidget *fit_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
-    gtk_widget_set_tooltip_text(fit_btn, "Fit to Window");
-    g_signal_connect(fit_btn, "clicked", G_CALLBACK(on_fit_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_btn);
-    self->fit_btn = fit_btn;
+    GtkWidget *fit_w_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
+    gtk_widget_set_tooltip_text(fit_w_btn, "Fit to Window");
+    g_signal_connect(fit_w_btn, "clicked", G_CALLBACK(on_fit_window_clicked), self);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_w_btn);
+    self->fit_window_btn = fit_w_btn;
+
+    GtkWidget *fit_wd_btn = gtk_button_new_from_icon_name("zoom-out-symbolic"); /* Temporary icon, ideally use something like 'zoom-original' or 'view-fullscreen-symbolic' rotated */
+    /* Let's use arrows-alt-h or similar if available, otherwise just use standard fit icon and tooltip distinction */
+    gtk_button_set_icon_name(GTK_BUTTON(fit_wd_btn), "view-paged-symbolic"); // "view-paged-symbolic" often implies width fit in some contexts, or we can reuse `zoom-fit-best`
+    gtk_widget_set_tooltip_text(fit_wd_btn, "Fit to Width");
+    g_signal_connect(fit_wd_btn, "clicked", G_CALLBACK(on_fit_width_clicked), self);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_wd_btn);
+    self->fit_width_btn = fit_wd_btn;
 
     GtkWidget *rot_l = gtk_button_new_from_icon_name("object-rotate-left-symbolic");
     gtk_widget_set_tooltip_text(rot_l, "Rotate Left");
@@ -1831,12 +2077,14 @@ bright_eyes_window_init(BrightEyesWindow *self)
     
     /* Setup actions for the menu */
     GSimpleActionGroup *actions = g_simple_action_group_new();
+    self->win_actions = g_object_ref(actions);
     
     GActionEntry action_entries[] = {
         { "preferences", on_preferences_action, NULL, NULL, NULL },
         { "shortcuts", on_shortcuts_action, NULL, NULL, NULL },
         { "about", on_about_action, NULL, NULL, NULL },
         { "open-editor", on_open_editor_action, NULL, NULL, NULL },
+        { "convert-to-cbz", on_convert_to_cbz_action, NULL, NULL, NULL },
         { "ocr-whole", on_ocr_whole_action, NULL, NULL, NULL },
         { "ocr-selection", on_ocr_selection_action, NULL, NULL, NULL },
         { "clear-selection", on_clear_selection_action, NULL, NULL, NULL }
@@ -1847,6 +2095,7 @@ bright_eyes_window_init(BrightEyesWindow *self)
     g_object_unref(actions);
     
     GMenu *menu = g_menu_new();
+    g_menu_append(menu, "Convert to CBZ", "win.convert-to-cbz");
     g_menu_append(menu, "Preferences", "win.preferences");
     g_menu_append(menu, "Keyboard Shortcuts", "win.shortcuts");
     g_menu_append(menu, "About BrightEyes", "win.about");
@@ -1914,6 +2163,8 @@ void
 bright_eyes_window_open_file(BrightEyesWindow *self, const char *path)
 {
     if (path) {
+        check_cbr_prompt(self, path);
+
         curator_set_current_file(self->curator, path);
         
         /* Get resolved path */

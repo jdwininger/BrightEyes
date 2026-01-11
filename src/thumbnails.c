@@ -2,6 +2,7 @@
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <gst/gst.h>
 #include <sys/stat.h>
+#include "archive.h"
 
 /* Thumbnails (UI)
  *
@@ -95,6 +96,35 @@ thumbnail_item_init(ThumbnailItem *self) {
     self->load_timeout_id = 0;
 }
 
+static void on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data);
+
+static void
+on_archive_thumbnail_bytes_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    ThumbnailItem *self = BRIGHTEYES_THUMBNAIL_ITEM(user_data);
+    GError *err = NULL;
+    GBytes *bytes = archive_read_entry_bytes_finish(res, &err);
+    
+    if (bytes) {
+        gsize size = g_bytes_get_size(bytes);
+        const guint8 *data = g_bytes_get_data(bytes, NULL);
+        guint8 *copy = g_malloc(size);
+        memcpy(copy, data, size);
+        GInputStream *mem = g_memory_input_stream_new_from_data(copy, (gssize)size, g_free);
+        g_bytes_unref(bytes);
+        
+        gdk_pixbuf_new_from_stream_at_scale_async(G_INPUT_STREAM(mem), 128, 128, TRUE, NULL, on_pixbuf_loaded, self);
+        g_object_unref(mem);
+    } else {
+        if (!g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+             g_warning("Failed to load archive thumb %s: %s", self->path, err->message);
+        }
+        g_clear_error(&err);
+        self->loading = FALSE;
+        g_object_unref(self);
+    }
+}
+
 static ThumbnailItem *
 thumbnail_item_new(const char *path) {
     return g_object_new(TYPE_THUMBNAIL_ITEM, "path", path, NULL);
@@ -129,6 +159,7 @@ static void thumbnails_print_instrumentation(void);
 /* Forward declare helper */
 static gboolean is_video(const char *path);
 static void on_item_destroyed(gpointer data, GObject *where);
+static void on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data);
 
 static GdkTexture *
 texture_from_pixbuf(GdkPixbuf *pixbuf) {
@@ -253,30 +284,7 @@ lru_cache_destroy(void)
     }
 }
 
-static void
-on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
-{
-    ThumbnailItem *self = BRIGHTEYES_THUMBNAIL_ITEM(user_data);
-    GError *err = NULL;
-    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream_finish(res, &err);
-    
-    if (pixbuf) {
-        GdkTexture *texture = texture_from_pixbuf(pixbuf);
-        /* Cache by path+mtime so repeated opens avoid re-decoding */
-        gchar *key = make_cache_key(self->path);
-        if (key) {
-            lru_cache_put(key, GDK_PAINTABLE(texture));
-            g_free(key);
-        }
-        g_object_set(self, "paintable", texture, NULL);
-        g_object_unref(texture);
-        g_object_unref(pixbuf);
-    } else {
-        /* Failed or cancelled */
-        g_clear_error(&err);
-    }
-    g_object_unref(self); /* Dec ref from load start */
-}
+
 
 static void
 create_video_thumbnail_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
@@ -348,6 +356,8 @@ on_video_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
     GError *err = NULL;
     GdkPixbuf *pixbuf = g_task_propagate_pointer(G_TASK(res), &err);
 
+    self->loading = FALSE;
+    
     if (pixbuf) {
         GdkTexture *texture = texture_from_pixbuf(pixbuf);
         gchar *key = make_cache_key(self->path);
@@ -368,6 +378,34 @@ on_video_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
         g_print("THUMBS-INSTR: video task completed for %s (completed=%u)\n", self->path ? self->path : "(null)", instr_video_tasks_completed);
     }
 
+    g_object_unref(self);
+}
+
+static void
+on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    ThumbnailItem *self = BRIGHTEYES_THUMBNAIL_ITEM(user_data);
+    GError *err = NULL;
+    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream_finish(res, &err);
+    
+    self->loading = FALSE;
+
+    if (pixbuf) {
+        GdkTexture *texture = texture_from_pixbuf(pixbuf);
+        gchar *key = make_cache_key(self->path);
+        if (key) {
+             lru_cache_put(key, GDK_PAINTABLE(texture));
+             g_free(key);
+        }
+        g_object_set(self, "paintable", texture, NULL);
+        g_object_unref(texture);
+        g_object_unref(pixbuf);
+    } else {
+         if (!g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+             /* g_warning("Failed to load thumbnail pixbuf: %s", err ? err->message : "?"); */
+         }
+         g_clear_error(&err);
+    }
     g_object_unref(self);
 }
 
@@ -445,6 +483,22 @@ thumbnail_item_ensure_loaded(ThumbnailItem *self)
         return;
     }
     
+    /* Archive detection */
+    if (g_str_has_prefix(self->path, "archive://")) {
+        const char *sep = strstr(self->path, "::");
+        if (sep) {
+            size_t len = sep - (self->path + strlen("archive://"));
+            char *arch_path = g_strndup(self->path + strlen("archive://"), len);
+            char *entry_name = g_strdup(sep + 2);
+            /* archive_read_entry_bytes_async takes ownership of self via callback user_data? No, we used g_object_ref(self) above. */
+            archive_read_entry_bytes_async(arch_path, entry_name, NULL, on_archive_thumbnail_bytes_loaded, self);
+            g_free(arch_path);
+            g_free(entry_name);
+            /* Don't unref self here, callback will */
+            return;
+        }
+    }
+
     GFile *file = g_file_new_for_path(self->path);
     /* Note: Sync read of file handle, but decoding is async. Acceptable for now. */
     GFileInputStream *stream = g_file_read(file, NULL, NULL); 

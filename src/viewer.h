@@ -19,6 +19,7 @@ void viewer_zoom_in(Viewer *self);
 void viewer_zoom_out(Viewer *self);
 void viewer_zoom_reset(Viewer *self);
 void viewer_set_fit_to_window(Viewer *self, gboolean fit);
+void viewer_set_fit_to_width(Viewer *self);
 void viewer_rotate_cw(Viewer *self);
 void viewer_rotate_ccw(Viewer *self);
 
@@ -29,6 +30,9 @@ void viewer_set_dark_background(Viewer *self, gboolean dark);
 void viewer_set_default_fit(Viewer *self, gboolean fit);
 
 guint viewer_get_zoom_level_percentage(Viewer *self);
+
+void viewer_set_fit_to_width(Viewer *self);
+gboolean viewer_is_fit_to_width(Viewer *self);
 
 /* Returns TRUE if currently playing a video (GST_STATE_PLAYING). */
 gboolean viewer_is_playing(Viewer *self);
