@@ -677,6 +677,17 @@ on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
     /* Update the image now that we have a pixbuf */
     viewer_update_image(self);
 
+    /* Reset vertical scroll to the top of the new page so users start at the
+     * top when switching pages. This is applied immediately; if layout has not
+     * fully settled yet, our idle-based centering logic will not override it
+     * because we clear pending center state on new loads.
+     */
+    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+    if (vadj) {
+        gtk_adjustment_set_value(vadj, 0.0);
+        self->has_pending_center = FALSE;
+    }
+
     const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
     gtk_stack_set_visible_child_name(GTK_STACK(self->image_stack), view_name);
     
@@ -1521,9 +1532,12 @@ void viewer_zoom_out(Viewer *self) {
 }
 
 void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
+    g_debug("viewer_set_fit_to_window called: fit=%d (was fit_to_width=%d fit_to_window=%d)", (int)fit, (int)self->fit_to_width, (int)self->fit_to_window);
     self->fit_to_window = fit ? TRUE : FALSE;
     if (fit) {
         self->fit_to_width = FALSE;
+        /* Clear any pending center since fit-to-window will center explicitly */
+        self->has_pending_center = FALSE;
         viewer_update_image(self);
         /* center viewport */
         GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
@@ -1534,10 +1548,12 @@ void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
         double upper_y = gtk_adjustment_get_upper(vadj) - page_y;
         gtk_adjustment_set_value(hadj, CLAMP(upper_x/2.0, 0.0, upper_x));
         gtk_adjustment_set_value(vadj, CLAMP(upper_y/2.0, 0.0, upper_y));
+        g_debug("viewer_set_fit_to_window: centered to (%f,%f)", gtk_adjustment_get_value(hadj), gtk_adjustment_get_value(vadj));
     }
 }
 
 void viewer_set_fit_to_width(Viewer *self) {
+    g_debug("viewer_set_fit_to_width called (before fit_to_width=%d fit_to_window=%d)", (int)self->fit_to_width, (int)self->fit_to_window);
     /* Fit image width to the *visible viewport* width, preserving aspect ratio.
      * We also preserve the current viewport center to avoid jumping to (0,0).
      */
@@ -1549,25 +1565,34 @@ void viewer_set_fit_to_width(Viewer *self) {
     double page_x = gtk_adjustment_get_page_size(hadj);
     double page_y = gtk_adjustment_get_page_size(vadj);
     double val_x = gtk_adjustment_get_value(hadj);
-    double val_y = gtk_adjustment_get_value(vadj);
 
     if (before_scale > 1e-6) {
         self->pending_center_x = (val_x + page_x / 2.0) / before_scale;
-        self->pending_center_y = (val_y + page_y / 2.0) / before_scale;
+        /* For fit-to-width we want the image to align to the TOP vertically.
+         * Compute a content-space Y such that after scaling the viewport will
+         * be positioned at the top (new_val_y == 0):
+         *   0 = pending_center_y * zoom - page_y/2  => pending_center_y = page_y/(2*zoom)
+         * Use the zoom we will apply for fit-to-width.
+         */
+        self->fit_to_window = FALSE;
+        self->fit_to_width = TRUE;
+        self->zoom_level = get_fit_width_zoom(self);
+
+        self->pending_center_y = page_y / (2.0 * self->zoom_level);
         self->has_pending_center = TRUE;
         self->center_retry_count = 0;
     } else {
         self->has_pending_center = FALSE;
+        self->fit_to_window = FALSE;
+        self->fit_to_width = TRUE;
+        self->zoom_level = get_fit_width_zoom(self);
     }
-
-    self->fit_to_window = FALSE;
-    self->fit_to_width = TRUE;
 
     /* Compute zoom from current viewport width. If layout isn't ready yet,
      * viewer_update_image() will recompute once page-size becomes non-zero.
      */
-    self->zoom_level = get_fit_width_zoom(self);
     viewer_update_image(self);
+    g_debug("viewer_set_fit_to_width: set zoom=%f pending_center=(%f,%f)", self->zoom_level, self->pending_center_x, self->pending_center_y);
 }
 
 void viewer_zoom_reset(Viewer *self) {
