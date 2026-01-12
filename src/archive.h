@@ -28,4 +28,9 @@ gboolean archive_delete_entry(const char *archive_path, const char *entry_name, 
 /* Convert any supported archive format (like CBR/RAR) to a CBZ (Zip) archive. */
 gboolean archive_convert_to_cbz(const char *source_path, const char *dest_path, GError **error);
 
+/* Create a CBZ (zip) from all image files in a folder. The function will
+ * write to a temporary file and rename into place on success. Returns TRUE
+ * on success and sets `error` on failure. */
+gboolean archive_create_cbz_from_folder(const char *folder_path, const char *dest_path, GError **error);
+
 #endif /* BRIGHTEYES_ARCHIVE_H */

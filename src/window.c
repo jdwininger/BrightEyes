@@ -34,7 +34,7 @@ struct _BrightEyesWindow {
     Viewer *viewer;
     Curator *curator;
     ThumbnailsBar *thumbnails;
-    GtkHeaderBar *header_bar;
+    AdwHeaderBar *header_bar;
     AdwOverlaySplitView *split_view; /* Thumbnails (Outer) */
     AdwOverlaySplitView *metadata_view; /* Metadata (Inner) */
     GtkWidget *toast_overlay; /* Added toast overlay */
@@ -63,6 +63,8 @@ struct _BrightEyesWindow {
 
     /* OCR */
     char *ocr_language; /* Tesseract language code, e.g. "eng" */
+    /* Create CBZ button (only visible for non-archive image views) */
+    GtkWidget *create_cbz_btn; /* Create CBZ button */
 };
 
 G_DEFINE_TYPE(BrightEyesWindow, bright_eyes_window, ADW_TYPE_APPLICATION_WINDOW)
@@ -281,9 +283,22 @@ static void
 update_zoom_ui_for_file_type(BrightEyesWindow *self, const char *path)
 {
     gboolean is_comic = (path && g_str_has_prefix(path, "archive://"));
-    
+    g_debug("%s: path='%s' is_comic=%d create_cbz_btn=%p", __func__, path ? path : "(null)", is_comic, self->create_cbz_btn);
+
     gtk_widget_set_visible(self->zoom_in_btn, !is_comic);
     gtk_widget_set_visible(self->zoom_out_btn, !is_comic);
+    if (self->create_cbz_btn) {
+            gtk_widget_set_sensitive(self->create_cbz_btn, !is_comic);
+            int btn_w = gtk_widget_get_width(self->create_cbz_btn);
+            int btn_h = gtk_widget_get_height(self->create_cbz_btn);
+            int header_w = -1, header_h = -1;
+            if (self->header_bar) {
+                header_w = gtk_widget_get_width(GTK_WIDGET(self->header_bar));
+                header_h = gtk_widget_get_height(GTK_WIDGET(self->header_bar));
+            }
+            g_debug("%s: create_cbz_btn set_sensitive=%d visible=%d alloc=(%d,%d) header_alloc=(%d,%d)",
+                    __func__, !is_comic, gtk_widget_get_visible(self->create_cbz_btn), btn_w, btn_h, header_w, header_h);
+    }
     
     /* Ensure fit buttons are visible (they are always relevant) */
     gtk_widget_set_visible(self->fit_window_btn, TRUE);
@@ -1300,6 +1315,86 @@ convert_cbz_thread(GTask *task, gpointer source_object, gpointer task_data, GCan
 }
 
 static void
+create_cbz_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+{
+    char **paths = (char **)task_data;
+    const char *folder = paths[0];
+    const char *dst = paths[1];
+    GError *error = NULL;
+
+    if (archive_create_cbz_from_folder(folder, dst, &error)) {
+        g_task_return_boolean(task, TRUE);
+    } else {
+        g_task_return_error(task, error);
+    }
+}
+
+static void
+on_create_cbz_finished(GObject *source_object, GAsyncResult *res, gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(source_object);
+    GError *error = NULL;
+
+    if (g_task_propagate_boolean(G_TASK(res), &error)) {
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("CBZ created"));
+    } else {
+        g_warning("Create CBZ failed: %s", error->message);
+        g_autofree char *msg = g_strdup_printf("Create CBZ failed: %s", error->message);
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+        g_error_free(error);
+    }
+}
+
+static void
+start_create_cbz_task(BrightEyesWindow *self, const char *folder_path, const char *dest_path)
+{
+    if (g_file_test(dest_path, G_FILE_TEST_EXISTS)) {
+        g_autofree char *msg = g_strdup_printf("Destination already exists: %s", dest_path);
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+        return;
+    }
+
+    adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Creating CBZ..."));
+
+    GTask *task = g_task_new(self, NULL, on_create_cbz_finished, NULL);
+    char **paths = g_new(char *, 3);
+    paths[0] = g_strdup(folder_path);
+    paths[1] = g_strdup(dest_path);
+    paths[2] = NULL;
+    g_task_set_task_data(task, paths, (GDestroyNotify)g_strfreev);
+    g_task_run_in_thread(task, create_cbz_thread);
+    g_object_unref(task);
+}
+
+typedef struct { BrightEyesWindow *self; char *folder; } CreateCbzDlgData;
+
+static void
+on_create_cbz_save_response(GObject *source, GAsyncResult *result, gpointer user_data)
+{
+    CreateCbzDlgData *d = user_data;
+    GError *error = NULL;
+    GFile *file = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source), result, &error);
+    if (file) {
+        char *dest = g_file_get_path(file);
+        if (!g_str_has_suffix(dest, ".cbz") && !g_str_has_suffix(dest, ".CBZ")) {
+            char *tmp = g_strdup_printf("%s.cbz", dest);
+            g_free(dest);
+            dest = tmp;
+        }
+        start_create_cbz_task(d->self, d->folder, dest);
+        g_free(dest);
+        g_object_unref(file);
+    } else if (error) {
+        g_warning("Create CBZ dialog failed: %s", error->message);
+        g_clear_error(&error);
+    }
+
+    /* gtk_file_dialog_save() will destroy the dialog; cleanup our data */
+    g_free(d->folder);
+    g_free(d);
+}
+
+static void
 on_convert_cbz_finished(GObject *source_object, GAsyncResult *res, gpointer user_data)
 {
     BrightEyesWindow *self = BRIGHT_EYES_WINDOW(source_object);
@@ -1392,23 +1487,78 @@ on_convert_to_cbz_action(GSimpleAction *action, GVariant *parameter, gpointer us
     const char *current_file = curator_get_current(self->curator);
     
     if (!current_file) return;
-
-    char *archive_path = NULL;
     if (g_str_has_prefix(current_file, "archive://")) {
+        /* Convert an archive (existing behaviour) */
+        char *archive_path = NULL;
         const char *sep = strstr(current_file, "::");
         if (sep) {
             size_t len = sep - (current_file + strlen("archive://"));
             archive_path = g_strndup(current_file + strlen("archive://"), len);
         }
-    } else {
-        /* Not an archive we are inside */
-        return; 
+        if (archive_path) {
+            start_conversion_task(self, archive_path);
+            g_free(archive_path);
+        }
+        return;
     }
 
-    if (!archive_path) return;
+    /* Not an archive path: if current file is a regular file, offer to create a CBZ
+     * from other image files in the same folder. */
+    /* Quick image-extension test */
+    const char *ext = strrchr(current_file, '.');
+    if (!ext) {
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Current file is not an image"));
+        return;
+    }
 
-    start_conversion_task(self, archive_path);
-    g_free(archive_path);
+    /* Build list of image files in same directory */
+    char *folder = g_path_get_dirname(current_file);
+    GDir *d = g_dir_open(folder, 0, NULL);
+    if (!d) {
+        g_free(folder);
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Failed to read folder"));
+        return;
+    }
+
+    const char *entry;
+    GPtrArray *images = g_ptr_array_new_with_free_func(g_free);
+    while ((entry = g_dir_read_name(d)) != NULL) {
+        if (entry[0] == '.') continue;
+        char *lower = g_ascii_strdown(entry, -1);
+        if (g_str_has_suffix(lower, ".jpg") || g_str_has_suffix(lower, ".jpeg") || g_str_has_suffix(lower, ".png") ||
+            g_str_has_suffix(lower, ".bmp") || g_str_has_suffix(lower, ".gif") || g_str_has_suffix(lower, ".tiff") ||
+            g_str_has_suffix(lower, ".webp") ) {
+            char *full = g_build_filename(folder, entry, NULL);
+            g_ptr_array_add(images, full);
+        }
+        g_free(lower);
+    }
+    g_dir_close(d);
+
+    if (images->len == 0) {
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("No images found in folder"));
+        g_ptr_array_free(images, TRUE);
+        g_free(folder);
+        return;
+    }
+
+    /* Suggest filename */
+    char *folder_base = g_path_get_basename(folder);
+    char *suggest = g_strdup_printf("%s.cbz", folder_base);
+    g_free(folder_base);
+
+    typedef struct { BrightEyesWindow *self; char *folder; } CreateCbzDlgData;
+    CreateCbzDlgData *dlg_data = g_new0(CreateCbzDlgData, 1);
+    dlg_data->self = self;
+    dlg_data->folder = g_strdup(folder);
+
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dlg, "Create CBZ");
+    /* Optionally the suggested filename could be applied if the API supports it; skip to avoid deprecated calls */
+    gtk_file_dialog_save(dlg, GTK_WINDOW(self), NULL, on_create_cbz_save_response, dlg_data);
+    g_free(suggest);
+    g_ptr_array_free(images, TRUE);
+    g_free(folder);
 }
 
 static char *
@@ -1530,6 +1680,13 @@ on_default_zoom_changed(AdwComboRow *row, GParamSpec *pspec, gpointer user_data)
     self->default_fit_to_window = (selected == 0);
     apply_default_zoom_pref(self);
     save_settings(self);
+}
+
+static void
+on_create_cbz_clicked(GtkWidget *btn, gpointer user_data)
+{
+    /* Call the existing action handler with NULL action/params but pass the window as user_data. */
+    on_convert_to_cbz_action(NULL, NULL, user_data);
 }
 
 static void
@@ -1916,6 +2073,42 @@ bright_eyes_window_class_init(BrightEyesWindowClass *klass)
     object_class->dispose = bright_eyes_window_dispose;
 }
 
+/* Log header children and allocations once the UI has had a chance to realize */
+static gboolean
+log_header_children(gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+    if (!self->header_bar) return FALSE;
+
+    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(self->header_bar));
+    int idx = 0;
+    while (child) {
+        const char *name = gtk_widget_get_name(child);
+        g_debug("header child[%d]: ptr=%p type=%s name=%s visible=%d sensitive=%d alloc=(%d,%d)",
+            idx, child, G_OBJECT_TYPE_NAME(child), name ? name : "(noname)",
+            gtk_widget_get_visible(child), gtk_widget_get_sensitive(child),
+            gtk_widget_get_width(child), gtk_widget_get_height(child));
+        child = gtk_widget_get_next_sibling(child);
+        idx++;
+    }
+    return FALSE; /* run once */
+}
+
+/* Runtime probe: check whether the active icon theme provides common
+ * archive-related symbolic icons and log the results to aid debugging. */
+static void
+probe_icon_theme(BrightEyesWindow *self)
+{
+    (void)self;
+    GtkIconTheme *theme = gtk_icon_theme_get_for_display(gdk_display_get_default());
+    const char *names[] = { "archive-symbolic", "book-open-symbolic", "folder-zip-symbolic", "open-book", "package-symbolic" };
+    for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
+        const char *n = names[i];
+        gboolean has = gtk_icon_theme_has_icon(theme, n);
+        g_debug("ICON_PROBE: %s -> %s", n, has ? "yes" : "no");
+    }
+}
+
 static void
 bright_eyes_window_init(BrightEyesWindow *self)
 {
@@ -2006,6 +2199,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
 
     /* Header Bar */
     GtkWidget *header = adw_header_bar_new();
+    /* Keep a reference to the header bar on the window for diagnostics and updates */
+    self->header_bar = ADW_HEADER_BAR(header);
     
     /* Pack Start: Open Files, Then Viewer Controls */
     GtkWidget *open_btn = gtk_button_new_from_icon_name("document-open-symbolic");
@@ -2126,6 +2321,49 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_widget_set_tooltip_text(ocr_btn, "OCR");
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), ocr_btn);
     g_object_unref(ocr_menu);
+
+    /* Create CBZ from folder button (visible by default, enabled only for non-archive views) */
+    GtkWidget *create_cbz_btn;
+    /* Prefer archive-related icons; avoid falling back to a generic save icon. */
+    GtkIconTheme *icon_theme = gtk_icon_theme_get_for_display(gdk_display_get_default());
+    const char *cbz_icon = NULL;
+    if (gtk_icon_theme_has_icon(icon_theme, "archive-symbolic")) {
+        cbz_icon = "archive-symbolic";
+    } else if (gtk_icon_theme_has_icon(icon_theme, "book-open-symbolic")) {
+        cbz_icon = "book-open-symbolic";
+    } else if (gtk_icon_theme_has_icon(icon_theme, "folder-zip-symbolic")) {
+        cbz_icon = "folder-zip-symbolic";
+    } else if (gtk_icon_theme_has_icon(icon_theme, "package-x-generic-symbolic")) {
+        cbz_icon = "package-x-generic-symbolic";
+    } else if (gtk_icon_theme_has_icon(icon_theme, "open-book")) {
+        cbz_icon = "open-book";
+    } else if (gtk_icon_theme_has_icon(icon_theme, "package-symbolic")) {
+        cbz_icon = "package-symbolic";
+    } else {
+        /* If none of the theme icons exist, prefer a clear semantic symbolic
+         * icon that many themes provide. Avoid using the application logo here. */
+        cbz_icon = "folder-zip-symbolic";
+    }
+
+    /* Create the button from the resolved icon name so the header styling
+     * and sizing remain consistent with other header buttons. */
+    create_cbz_btn = gtk_button_new_from_icon_name(cbz_icon);
+    gtk_widget_set_tooltip_text(create_cbz_btn, "Create CBZ from Folder");
+    adw_header_bar_pack_end(ADW_HEADER_BAR(header), create_cbz_btn);
+    /* Store reference for visibility/sensitivity updates */
+    self->create_cbz_btn = create_cbz_btn;
+    /* Clicking triggers same action as Convert-to-CBZ but will handle non-archive paths */
+    g_signal_connect(create_cbz_btn, "clicked", G_CALLBACK(on_create_cbz_clicked), self);
+    /* Show button always; sensitivity controlled by file type */
+    gtk_widget_set_visible(create_cbz_btn, TRUE);
+    g_debug("%s: create_cbz_btn=%p visible=%d sensitive=%d", __func__, create_cbz_btn,
+            gtk_widget_get_visible(create_cbz_btn), gtk_widget_get_sensitive(create_cbz_btn));
+
+    /* Probe the icon theme so we can see which icon names are actually provided
+     * by the current theme at runtime (helps diagnose placeholder fallbacks). */
+    probe_icon_theme(self);
+
+    /* Schedule a one-shot idle log to capture final allocations (moved after toolbar insertion) */
     
     /* Status Bar */
     GtkWidget *status_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
@@ -2142,6 +2380,9 @@ bright_eyes_window_init(BrightEyesWindow *self)
     adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar_view), header);
     adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar_view), status_bar);
     adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->split_view));
+
+    /* Now that the header is a child of the toolbar view, log children once to diagnose layout */
+    g_idle_add(log_header_children, self);
     
     adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), toolbar_view);
 

@@ -17,7 +17,10 @@ lept_dep = dependency('lept', required : false)
 libarchive_dep = dependency('libarchive', required: false)
 
 gst_dep = dependency('gstreamer-1.0', required: false)
+glib_dep = dependency('glib-2.0', required: true)
 gstvideo_dep = dependency('gstreamer-video-1.0', required: false)
+
+gio_dep = dependency('gio-2.0', required: true)
 
 gnome = import('gnome')
 resources = gnome.compile_resources('brighteyes-resources',
@@ -49,6 +52,27 @@ add_project_link_arguments('-lm', language : 'c')
 executable('brighteyes', sources + resources,
   dependencies : deps,
   install : true
+)
+
+# Small test tool to exercise archive conversion logic from the command line
+executable('archive-convert-test', 'tools/convert_test.c',
+  dependencies : [libarchive_dep, glib_dep],
+  install : false
+)
+
+executable('zip-test', 'tools/zip_test.c',
+  dependencies : libarchive_dep,
+  install : false
+)
+
+executable('run-archive-convert', ['tools/run_archive_convert.c', 'src/archive.c'],
+  dependencies : [glib_dep, libarchive_dep, gio_dep],
+  install : false
+)
+
+executable('archive-convert-verify', ['tools/convert_verify.c', 'src/archive.c'],
+  dependencies : [glib_dep, libarchive_dep, gio_dep],
+  install : false
 )
 
 install_data('data/org.jeremy.BrightEyes.desktop', install_dir : 'share/applications')

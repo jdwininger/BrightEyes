@@ -87,6 +87,8 @@ struct _Viewer {
     double scroll_accumulator;
     guint scroll_timeout_id;
     GCancellable *load_cancellable;
+    /* Monotonic load sequence to drop stale async load completions. */
+    guint64 load_seq;
     /* Monotonic timestamps (microseconds) to avoid races where an in-flight
      * load completion overrides a later user/programmatic fit toggle. */
     guint64 load_start_time;
@@ -96,8 +98,30 @@ struct _Viewer {
      * by default; set BRIGHTEYES_DEBUG_LOAD_RACE=1 to enable verbose repro logging
      * and BRIGHTEYES_RUN_LOAD_RACE_TEST=1 to run a small deterministic self-test
      * at startup that simulates the race and prints results. */
-    gboolean debug_repro_enabled;
+    /* debug_repro_enabled (removed): always-off debug hook was removed */
 };
+
+typedef struct {
+    Viewer *self;
+    guint64 load_seq;
+} LoadCtx;
+
+static LoadCtx *
+load_ctx_new(Viewer *self, guint64 load_seq)
+{
+    LoadCtx *ctx = g_new0(LoadCtx, 1);
+    ctx->self = g_object_ref(self);
+    ctx->load_seq = load_seq;
+    return ctx;
+}
+
+static void
+load_ctx_free(LoadCtx *ctx)
+{
+    if (!ctx) return;
+    g_object_unref(ctx->self);
+    g_free(ctx);
+}
 
 /* scroll_timeout_cb removed: unused while scroll-wheel zoom is disabled. */
 
@@ -321,14 +345,14 @@ viewer_init(Viewer *self)
     self->original_texture = NULL;
     self->original_texture_rotation_angle = -1;
 
+    /* Initialize load sequencing */
+    self->load_seq = 0;
+
     /* Initialize monotonic timestamps */
     self->load_start_time = 0;
     self->last_user_fit_time = 0;
 
-    /* Debug/repro flags (disabled by default). Enable via env: BRIGHTEYES_DEBUG_LOAD_RACE=1
-     * to get extra logs, and BRIGHTEYES_RUN_LOAD_RACE_TEST=1 to run a deterministic
-     * self-test at startup that simulates the load-vs-user-fit race. */
-    self->debug_repro_enabled = g_getenv("BRIGHTEYES_DEBUG_LOAD_RACE") != NULL; 
+    /* Debug/repro flags removed: use logging (g_debug/g_info) instead. */
 
     /* Start with full volume by default */
     self->saved_volume = 1.0;
@@ -677,23 +701,20 @@ handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf)
     self->zoom_level = 1.0;
     self->rotation_angle = 0;
 
-    if (self->debug_repro_enabled) {
-        g_warning("handle_loaded_pixbuf: load_start_time=%" G_GUINT64_FORMAT " last_user_fit_time=%" G_GUINT64_FORMAT,
-                  self->load_start_time, self->last_user_fit_time);
-    }
+    /* load timing available via g_info/g_debug logs if needed */
 
     /* Preserve fit-to-width across page loads (e.g. comics) UNLESS the fit
      * mode was changed after this load began. In that case we should not
      * override the newer user/programmatic choice. */
     if (self->last_user_fit_time > 0 && self->last_user_fit_time > self->load_start_time) {
-        if (self->debug_repro_enabled) {
-            g_warning("handle_loaded_pixbuf: skipping override because last_user_fit_time=%" G_GUINT64_FORMAT " > load_start_time=%" G_GUINT64_FORMAT,
-                      self->last_user_fit_time, self->load_start_time);
-        } else {
-            g_debug("handle_loaded_pixbuf: not overriding fit (user changed fit after load started)");
-        }
+        g_info("handle_loaded_pixbuf: skipping override because last_user_fit_time=%" G_GUINT64_FORMAT " > load_start_time=%" G_GUINT64_FORMAT,
+               self->last_user_fit_time, self->load_start_time);
+
+        /* debug hint removed */
     } else {
         self->fit_to_window = self->fit_to_width ? FALSE : self->default_fit;
+        g_info("handle_loaded_pixbuf: overriding fit -> fit_to_window=%d (fit_to_width=%d default_fit=%d) load_start_time=%" G_GUINT64_FORMAT " last_user_fit_time=%" G_GUINT64_FORMAT,
+               self->fit_to_window, self->fit_to_width, self->default_fit, self->load_start_time, self->last_user_fit_time);
     }
 
     /* Update the image now that we have a pixbuf */
@@ -707,13 +728,12 @@ handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf)
         if (vadj) {
             gtk_adjustment_set_value(vadj, 0.0);
             self->has_pending_center = FALSE;
+            g_info("handle_loaded_pixbuf: reset vertical scroll to top (load_start_time=%" G_GUINT64_FORMAT " last_user_fit_time=%" G_GUINT64_FORMAT ")",
+                   self->load_start_time, self->last_user_fit_time);
         }
     } else {
-        if (self->debug_repro_enabled) {
-            g_warning("handle_loaded_pixbuf: preserving user viewport/centering after a later fit toggle");
-        } else {
-            g_debug("on_pixbuf_loaded: preserving user viewport/centering after a later fit toggle");
-        }
+        g_info("handle_loaded_pixbuf: not resetting vertical scroll (last_user_fit_time=%" G_GUINT64_FORMAT " > load_start_time=%" G_GUINT64_FORMAT ")",
+               self->last_user_fit_time, self->load_start_time);
     }
 
     const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
@@ -723,35 +743,36 @@ handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf)
 static void
 on_pixbuf_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
 {
-    Viewer *self = VIEWER(user_data);
+    LoadCtx *ctx = (LoadCtx *)user_data;
+    Viewer *self = VIEWER(ctx->self);
     GError *err = NULL;
     GdkPixbuf *pixbuf = gdk_pixbuf_new_from_stream_finish(res, &err);
 
+    if (ctx->load_seq != self->load_seq) {
+        /* Stale completion from an older navigation: ignore it. */
+        if (pixbuf) g_object_unref(pixbuf);
+        g_clear_error(&err);
+        load_ctx_free(ctx);
+        return;
+    }
+
     if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
         g_clear_error(&err);
-        g_object_unref(self);
+        load_ctx_free(ctx);
         return;
     }
 
     if (!pixbuf) {
-        g_warning("Failed to load image: %s", err ? err->message : "Unknown error");
+        g_warning("Failed to load image: %s", err ? err->message : "unknown error");
         g_clear_error(&err);
-        g_object_unref(self);
+        load_ctx_free(ctx);
         return;
     }
-
-    /* If we have a new cancellable (i.e. another load started), discard this result? 
-       No, the cancellable we passed would have been triggered. 
-       But self->load_cancellable might be DIFFERENT now if a new load started and we didn't use the one passed?
-       In this design, we use self->load_cancellable passed to the async func. 
-       If a new load started, self->load_cancellable was replaced and the old one cancelled. 
-       So checking G_IO_ERROR_CANCELLED is sufficient.
-    */
 
     /* Hand off the loaded pixbuf to the common handler */
     handle_loaded_pixbuf(self, pixbuf);
 
-    g_object_unref(self);
+    load_ctx_free(ctx);
 }
 
 /* Deterministic self-test to simulate the race between a load and a later
@@ -794,21 +815,29 @@ run_load_race_test_cb(gpointer user_data)
 static void
 on_archive_entry_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
 {
-    Viewer *self = VIEWER(user_data);
+    LoadCtx *ctx = (LoadCtx *)user_data;
+    Viewer *self = VIEWER(ctx->self);
     GError *err = NULL;
     GBytes *bytes = archive_read_entry_bytes_finish(res, &err);
 
+    if (ctx->load_seq != self->load_seq) {
+        /* Stale completion from an older navigation: ignore it. */
+        if (bytes) g_bytes_unref(bytes);
+        g_clear_error(&err);
+        load_ctx_free(ctx);
+        return;
+    }
+
     if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
         g_clear_error(&err);
-        g_object_unref(self);
+        load_ctx_free(ctx);
         return;
     }
 
     if (!bytes) {
         g_warning("Failed to read archive entry: %s", err ? err->message : "unknown");
         g_clear_error(&err);
-        /* If we fail, we still own the ref to self, so unref it */
-        g_object_unref(self);
+        load_ctx_free(ctx);
         return;
     }
 
@@ -823,38 +852,47 @@ on_archive_entry_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
     g_bytes_unref(bytes);
 
     /* Feed into gdk-pixbuf async loader */
-    /* Pass ownership of 'self' to the next callback */
+    /* Pass ownership of 'ctx' to the next callback */
     gdk_pixbuf_new_from_stream_async(G_INPUT_STREAM(mem), 
                                      self->load_cancellable, 
                                      on_pixbuf_loaded, 
-                                     self);
+                                     ctx);
     g_object_unref(mem);
 }
 
 static void
 on_file_read(GObject *source, GAsyncResult *res, gpointer user_data)
 {
-    Viewer *self = VIEWER(user_data);
+    LoadCtx *ctx = (LoadCtx *)user_data;
+    Viewer *self = VIEWER(ctx->self);
     GError *err = NULL;
     GFileInputStream *stream = g_file_read_finish(G_FILE(source), res, &err);
 
+    if (ctx->load_seq != self->load_seq) {
+        /* Stale completion from an older navigation: ignore it. */
+        if (stream) g_object_unref(stream);
+        g_clear_error(&err);
+        load_ctx_free(ctx);
+        return;
+    }
+
     if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
         g_clear_error(&err);
-        g_object_unref(self);
+        load_ctx_free(ctx);
         return;
     }
 
     if (!stream) {
         g_warning("Failed to open file: %s", err ? err->message : "Unknown error");
         g_clear_error(&err);
-        g_object_unref(self);
+        load_ctx_free(ctx);
         return;
     }
 
     gdk_pixbuf_new_from_stream_async(G_INPUT_STREAM(stream), 
                                      self->load_cancellable, 
                                      on_pixbuf_loaded, 
-                                     self);
+                                     ctx);
     
     g_object_unref(stream);
 }
@@ -868,10 +906,21 @@ viewer_load_file(Viewer *self, const char *path)
         g_clear_object(&self->load_cancellable);
     }
     self->load_cancellable = g_cancellable_new();
+
+    /* Bump load sequence so stale async completions can be dropped. */
+    self->load_seq++;
+    guint64 load_seq = self->load_seq;
+
     /* Record load start time so we can avoid races where a user toggles fit mode
      * while an async load is in-flight and then the load completion overrides
      * the user's explicit choice. Uses monotonic microsecond timestamp. */
     self->load_start_time = (guint64)g_get_monotonic_time();
+    g_info("viewer_load_file: LOAD_START seq=%llu time=%llu fit_to_width=%d fit_to_window=%d path=%s",
+           (unsigned long long)load_seq,
+           (unsigned long long)self->load_start_time,
+           (int)self->fit_to_width,
+           (int)self->fit_to_window,
+           path ? path : "(null)");
 
     /* Reset selection mode and clear selection on file change */
     self->selection_mode = FALSE;
@@ -909,8 +958,8 @@ viewer_load_file(Viewer *self, const char *path)
 
         g_debug("Loading image from archive '%s' entry '%s'", archive_path, entry_name);
 
-        g_object_ref(self);
-        archive_read_entry_bytes_async(archive_path, entry_name, self->load_cancellable, on_archive_entry_loaded, self);
+        LoadCtx *ctx = load_ctx_new(self, load_seq);
+        archive_read_entry_bytes_async(archive_path, entry_name, self->load_cancellable, on_archive_entry_loaded, ctx);
 
         g_free(archive_path);
         g_free(entry_name);
@@ -1012,8 +1061,8 @@ viewer_load_file(Viewer *self, const char *path)
         viewer_stop_playback(self);
         
         GFile *file = g_file_new_for_path(path);
-        g_object_ref(self);
-        g_file_read_async(file, G_PRIORITY_DEFAULT, self->load_cancellable, on_file_read, self);
+        LoadCtx *ctx = load_ctx_new(self, load_seq);
+        g_file_read_async(file, G_PRIORITY_DEFAULT, self->load_cancellable, on_file_read, ctx);
         g_object_unref(file);
     }
 }
@@ -1051,8 +1100,8 @@ viewer_update_image(Viewer *self)
                                                     rotated);
 
         self->original_texture = gdk_memory_texture_new(rwidth, rheight,
-                                                         has_alpha ? GDK_MEMORY_R8G8B8A8 : GDK_MEMORY_R8G8B8,
-                                                         rbytes, rstride);
+                                 has_alpha ? GDK_MEMORY_R8G8B8A8 : GDK_MEMORY_R8G8B8,
+                                 rbytes, rstride);
         g_bytes_unref(rbytes);
         self->original_texture_rotation_angle = self->rotation_angle;
 
@@ -1093,10 +1142,8 @@ viewer_update_image(Viewer *self)
             self->zoom_level = get_fit_width_zoom(self);
         }
 
-        int width = gdk_pixbuf_get_width(rotated);
-        int height = gdk_pixbuf_get_height(rotated);
-        int new_width = MAX(1, (int)(width * self->zoom_level));
-        int new_height = MAX(1, (int)(height * self->zoom_level));
+        int new_width = MAX(1, (int)(gdk_pixbuf_get_width(rotated) * self->zoom_level));
+        int new_height = MAX(1, (int)(gdk_pixbuf_get_height(rotated) * self->zoom_level));
 
         /* Decide whether content is smaller than viewport and allow shrinking then */
         GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
@@ -1112,8 +1159,16 @@ viewer_update_image(Viewer *self)
             */
         gtk_widget_set_size_request(self->image_stack, new_width, new_height);
 
-                gtk_picture_set_can_shrink(GTK_PICTURE(self->active_picture), TRUE);
-                gtk_widget_set_size_request(self->active_picture, new_width, new_height);
+        /* IMPORTANT: GtkStack's natural size considers all children.
+         * Ensure the inactive picture doesn't retain an old manual size request
+         * that would force the stack (and sometimes the toplevel) to grow.
+         */
+        GtkWidget *inactive_picture = (self->active_picture == self->picture_1) ? self->picture_2 : self->picture_1;
+        gtk_widget_set_size_request(inactive_picture, -1, -1);
+
+        gtk_picture_set_can_shrink(GTK_PICTURE(self->active_picture), TRUE);
+        gtk_picture_set_can_shrink(GTK_PICTURE(inactive_picture), TRUE);
+        gtk_widget_set_size_request(self->active_picture, new_width, new_height);
 
         /* If content is smaller than viewport, center the picture widget so it does
          * not stick to the top-left when zoomed out. Otherwise fill and allow scrolling.
@@ -1169,9 +1224,12 @@ viewer_update_image(Viewer *self)
         } else {
             g_warning("viewer_update_image: no texture available to set for fit-to-window");
         }
-        gtk_picture_set_can_shrink(GTK_PICTURE(self->active_picture), TRUE);
-        gtk_widget_set_size_request(self->active_picture, -1, -1);
+        /* Ensure both children can shrink; active picture swaps on navigation. */
+        gtk_picture_set_can_shrink(GTK_PICTURE(self->picture_1), TRUE);
+        gtk_picture_set_can_shrink(GTK_PICTURE(self->picture_2), TRUE);
 
+        gtk_widget_set_size_request(self->picture_1, -1, -1);
+        gtk_widget_set_size_request(self->picture_2, -1, -1);
         gtk_widget_set_size_request(self->image_stack, -1, -1);
         gtk_widget_set_halign(self->image_stack, GTK_ALIGN_FILL);
         gtk_widget_set_valign(self->image_stack, GTK_ALIGN_FILL);
@@ -1637,10 +1695,7 @@ void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
     /* Record when fit mode was changed so a concurrent load completion cannot
      * later override this user/programmatic change. */
     self->last_user_fit_time = (guint64)g_get_monotonic_time();
-    if (self->debug_repro_enabled) {
-        g_warning("viewer_set_fit_to_window: recorded last_user_fit_time=%" G_GUINT64_FORMAT " load_start_time=%" G_GUINT64_FORMAT,
-                  self->last_user_fit_time, self->load_start_time);
-    }
+    /* debug: last_user_fit_time recorded (see g_info/g_debug logs) */
     self->fit_to_window = fit ? TRUE : FALSE; 
     if (fit) {
         self->fit_to_width = FALSE;
@@ -1658,6 +1713,14 @@ void viewer_set_fit_to_window(Viewer *self, gboolean fit) {
         gtk_adjustment_set_value(vadj, CLAMP(upper_y/2.0, 0.0, upper_y));
         g_debug("viewer_set_fit_to_window: centered to (%f,%f)", gtk_adjustment_get_value(hadj), gtk_adjustment_get_value(vadj));
     }
+
+    g_info("viewer_set_fit_to_window: USER_ACTION seq=%llu action=fit_to_window fit=%d time=%llu load_start_time=%llu result_fit_to_window=%d result_fit_to_width=%d",
+           (unsigned long long)self->load_seq,
+           (int)fit,
+           (unsigned long long)self->last_user_fit_time,
+           (unsigned long long)self->load_start_time,
+           (int)self->fit_to_window,
+           (int)self->fit_to_width);
 }
 
 void viewer_set_fit_to_width(Viewer *self) {
@@ -1665,10 +1728,7 @@ void viewer_set_fit_to_width(Viewer *self) {
     /* Record when fit mode was changed so a concurrent load completion cannot
      * later override this user/programmatic change. */
     self->last_user_fit_time = (guint64)g_get_monotonic_time();
-    if (self->debug_repro_enabled) {
-        g_warning("viewer_set_fit_to_width: recorded last_user_fit_time=%" G_GUINT64_FORMAT " load_start_time=%" G_GUINT64_FORMAT,
-                  self->last_user_fit_time, self->load_start_time);
-    }
+    /* debug: last_user_fit_time recorded (see g_info/g_debug logs) */
     /* Fit image width to the *visible viewport* width, preserving aspect ratio.
      * We also preserve the current viewport center to avoid jumping to (0,0).
      */
@@ -1708,6 +1768,13 @@ void viewer_set_fit_to_width(Viewer *self) {
      */
     viewer_update_image(self);
     g_debug("viewer_set_fit_to_width: set zoom=%f pending_center=(%f,%f)", self->zoom_level, self->pending_center_x, self->pending_center_y);
+
+    g_info("viewer_set_fit_to_width: USER_ACTION seq=%llu action=fit_to_width time=%llu load_start_time=%llu result_fit_to_window=%d result_fit_to_width=%d",
+           (unsigned long long)self->load_seq,
+           (unsigned long long)self->last_user_fit_time,
+           (unsigned long long)self->load_start_time,
+           (int)self->fit_to_window,
+           (int)self->fit_to_width);
 }
 
 void viewer_zoom_reset(Viewer *self) {
