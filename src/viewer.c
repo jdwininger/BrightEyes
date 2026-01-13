@@ -76,6 +76,12 @@ struct _Viewer {
     /* Video Controls */
     GtkWidget *video_controls_overlay; /* The box containing controls */
     GtkWidget *play_pause_btn;
+    /* GIF playback controls */
+    GtkWidget *gif_play_forward_btn;
+    GtkWidget *gif_play_backward_btn;
+    GtkWidget *gif_step_forward_btn;
+    GtkWidget *gif_step_backward_btn;
+    GtkWidget *gif_stop_btn;
     GtkWidget *seek_scale;
     GtkWidget *volume_scale;
     GtkWidget *volume_btn;
@@ -86,6 +92,14 @@ struct _Viewer {
     /* Scroll accumulation for smooth zoom */
     double scroll_accumulator;
     guint scroll_timeout_id;
+    /* Animated GIF support */
+    GdkPixbufAnimation *animation;
+    GdkPixbufAnimationIter *anim_iter;
+    guint anim_timeout_id;
+    GPtrArray *anim_frames; /* array of GdkPixbuf* frames (refs) */
+    GArray *anim_frame_delays; /* per-frame delays in ms (guint) */
+    gint anim_current_frame; /* index into anim_frames */
+    gboolean anim_play_forward; /* direction when playing */
     GCancellable *load_cancellable;
     /* Monotonic load sequence to drop stale async load completions. */
     guint64 load_seq;
@@ -147,6 +161,16 @@ static double get_fit_zoom_level(Viewer *self);
 static double get_fit_width_zoom(Viewer *self);
 static void viewer_set_zoom_level_internal(Viewer *self, double target_scale, gboolean center);
 static gboolean run_load_race_test_cb(gpointer user_data);
+static void handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf);
+static gboolean animation_tick(gpointer user_data);
+
+/* Forward declaration for animation helper (defined below) so it can be
+ * referenced from earlier functions such as viewer_stop_playback(). */
+static void stop_animation(Viewer *self);
+
+/* Forward declarations for cache-driven animation helpers */
+static gboolean anim_cache_tick(gpointer user_data);
+static void display_anim_frame(Viewer *self, int idx);
 
 /* Animation helpers */
 /* Animation helpers removed. */
@@ -172,6 +196,11 @@ static void on_pan_drag_end(GtkGestureDrag *gesture, gdouble offset_x, gdouble o
 
 static void on_seek_value_changed(GtkRange *range, Viewer *self);
 static void on_volume_changed(GtkRange *range, Viewer *self);
+static void on_gif_play_forward_clicked(GtkButton *btn, Viewer *self);
+static void on_gif_play_backward_clicked(GtkButton *btn, Viewer *self);
+static void on_gif_step_forward_clicked(GtkButton *btn, Viewer *self);
+static void on_gif_step_backward_clicked(GtkButton *btn, Viewer *self);
+static void on_gif_stop_clicked(GtkButton *btn, Viewer *self);
 
 /* Deferred pointer-anchored scroll helper removed: unused while scroll-wheel zoom is disabled. */
 
@@ -212,11 +241,25 @@ on_video_update(gpointer data)
 static void
 on_play_pause_clicked(GtkButton *btn, Viewer *self)
 {
+    /* If a GIF animation is loaded, toggle GIF play/pause instead of GStreamer */
+    if (self->animation && self->anim_frames && self->anim_frames->len > 0) {
+        if (self->anim_timeout_id > 0) {
+            /* currently playing -> stop */
+            viewer_stop_animation_playback(self);
+            gtk_button_set_icon_name(btn, "media-playback-start-symbolic");
+        } else {
+            /* start forward playback */
+            viewer_play_forward(self);
+            gtk_button_set_icon_name(btn, "media-playback-pause-symbolic");
+        }
+        return;
+    }
+
     if (!self->playbin) return;
-    
+
     GstState state;
     gst_element_get_state(self->playbin, &state, NULL, 0);
-    
+
     if (state == GST_STATE_PLAYING) {
         gst_element_set_state(self->playbin, GST_STATE_PAUSED);
         gtk_button_set_icon_name(btn, "media-playback-start-symbolic");
@@ -227,6 +270,50 @@ on_play_pause_clicked(GtkButton *btn, Viewer *self)
         g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, TRUE);
     }
 }
+
+static void on_gif_play_forward_clicked(GtkButton *btn, Viewer *self)
+{
+    (void)btn;
+    g_info("on_gif_play_forward_clicked: anim_timeout_id=%u frames=%u",
+           (guint)self->anim_timeout_id,
+           (self->anim_frames) ? (guint)self->anim_frames->len : 0u);
+    viewer_play_forward(self);
+}
+
+static void on_gif_play_backward_clicked(GtkButton *btn, Viewer *self)
+{
+    (void)btn;
+    g_info("on_gif_play_backward_clicked: anim_timeout_id=%u frames=%u",
+           (guint)self->anim_timeout_id,
+           (self->anim_frames) ? (guint)self->anim_frames->len : 0u);
+    viewer_play_backward(self);
+}
+
+static void on_gif_step_forward_clicked(GtkButton *btn, Viewer *self)
+{
+    (void)btn;
+    g_info("on_gif_step_forward_clicked: anim_current_frame=%d frames=%u",
+           self->anim_current_frame,
+           (self->anim_frames) ? (guint)self->anim_frames->len : 0u);
+    viewer_step_forward(self);
+}
+
+static void on_gif_step_backward_clicked(GtkButton *btn, Viewer *self)
+{
+    (void)btn;
+    g_info("on_gif_step_backward_clicked: anim_current_frame=%d frames=%u",
+           self->anim_current_frame,
+           (self->anim_frames) ? (guint)self->anim_frames->len : 0u);
+    viewer_step_backward(self);
+}
+
+static void on_gif_stop_clicked(GtkButton *btn, Viewer *self)
+{
+    (void)btn;
+    g_info("on_gif_stop_clicked: anim_timeout_id=%u", (guint)self->anim_timeout_id);
+    viewer_stop_animation_playback(self);
+}
+
 
 static void
 on_seek_value_changed(GtkRange *range, Viewer *self)
@@ -487,6 +574,11 @@ viewer_init(Viewer *self)
     self->video_controls_overlay = gtk_center_box_new();
     gtk_widget_set_valign(self->video_controls_overlay, GTK_ALIGN_END);
     gtk_widget_set_margin_bottom(self->video_controls_overlay, 20);
+    /* Ensure overlay gets an allocation and can expand horizontally so the
+     * centered controls receive width. Also provide a minimum height to
+     * avoid zero-sized allocation on some toolkit versions. */
+    gtk_widget_set_hexpand(self->video_controls_overlay, TRUE);
+    gtk_widget_set_size_request(self->video_controls_overlay, -1, 48);
     /* No margins on the overlay itself - we manage spacing with the center box children */
     
     gtk_widget_set_visible(self->video_controls_overlay, FALSE);
@@ -507,10 +599,48 @@ viewer_init(Viewer *self)
     gtk_widget_set_size_request(right_spacer, 160, -1);
     gtk_center_box_set_end_widget(GTK_CENTER_BOX(self->video_controls_overlay), right_spacer);
 
+    /* GIF playback controls (hidden/disabled until an animated GIF is loaded) */
+    /* Use Adwaita symbolic icons that are widely available in GNOME themes. */
+    self->gif_play_backward_btn = gtk_button_new_from_icon_name("go-previous-symbolic");
+    gtk_widget_add_css_class(self->gif_play_backward_btn, "flat");
+    gtk_widget_set_sensitive(self->gif_play_backward_btn, FALSE);
+    g_signal_connect(self->gif_play_backward_btn, "clicked", G_CALLBACK(on_gif_play_backward_clicked), self);
+    gtk_widget_set_tooltip_text(self->gif_play_backward_btn, "Play GIF backward");
+    gtk_box_append(GTK_BOX(controls_box), self->gif_play_backward_btn);
+
+    self->gif_step_backward_btn = gtk_button_new_from_icon_name("go-first-symbolic");
+    gtk_widget_add_css_class(self->gif_step_backward_btn, "flat");
+    gtk_widget_set_sensitive(self->gif_step_backward_btn, FALSE);
+    g_signal_connect(self->gif_step_backward_btn, "clicked", G_CALLBACK(on_gif_step_backward_clicked), self);
+    gtk_widget_set_tooltip_text(self->gif_step_backward_btn, "Step back one frame");
+    gtk_box_append(GTK_BOX(controls_box), self->gif_step_backward_btn);
+
+    self->gif_stop_btn = gtk_button_new_from_icon_name("media-playback-stop-symbolic");
+    gtk_widget_add_css_class(self->gif_stop_btn, "flat");
+    gtk_widget_set_sensitive(self->gif_stop_btn, FALSE);
+    g_signal_connect(self->gif_stop_btn, "clicked", G_CALLBACK(on_gif_stop_clicked), self);
+    gtk_widget_set_tooltip_text(self->gif_stop_btn, "Stop GIF playback");
+    gtk_box_append(GTK_BOX(controls_box), self->gif_stop_btn);
+
+    self->gif_step_forward_btn = gtk_button_new_from_icon_name("go-last-symbolic");
+    gtk_widget_add_css_class(self->gif_step_forward_btn, "flat");
+    gtk_widget_set_sensitive(self->gif_step_forward_btn, FALSE);
+    g_signal_connect(self->gif_step_forward_btn, "clicked", G_CALLBACK(on_gif_step_forward_clicked), self);
+    gtk_widget_set_tooltip_text(self->gif_step_forward_btn, "Step forward one frame");
+    gtk_box_append(GTK_BOX(controls_box), self->gif_step_forward_btn);
+
+    self->gif_play_forward_btn = gtk_button_new_from_icon_name("go-next-symbolic");
+    gtk_widget_add_css_class(self->gif_play_forward_btn, "flat");
+    gtk_widget_set_sensitive(self->gif_play_forward_btn, FALSE);
+    g_signal_connect(self->gif_play_forward_btn, "clicked", G_CALLBACK(on_gif_play_forward_clicked), self);
+    gtk_widget_set_tooltip_text(self->gif_play_forward_btn, "Play GIF forward");
+    gtk_box_append(GTK_BOX(controls_box), self->gif_play_forward_btn);
+
     /* Play/Pause Button */
     self->play_pause_btn = gtk_button_new_from_icon_name("media-playback-pause-symbolic");
     gtk_widget_add_css_class(self->play_pause_btn, "flat");
     g_signal_connect(self->play_pause_btn, "clicked", G_CALLBACK(on_play_pause_clicked), self);
+    gtk_widget_set_tooltip_text(self->play_pause_btn, "Play / Pause (video or GIF)");
     gtk_box_append(GTK_BOX(controls_box), self->play_pause_btn);
 
     /* Seek Scale */
@@ -587,6 +717,8 @@ on_gst_error (GstBus *bus, GstMessage *msg, Viewer *self)
 static void
 viewer_stop_playback (Viewer *self)
 {
+    /* Also stop any GIF animation */
+    stop_animation(self);
     if (self->video_update_id > 0) {
         g_source_remove(self->video_update_id);
         self->video_update_id = 0;
@@ -682,6 +814,117 @@ viewer_is_playing(Viewer *self)
     GstState state;
     gst_element_get_state(self->playbin, &state, NULL, 0);
     return state == GST_STATE_PLAYING;
+}
+
+/* GIF playback control public wrappers */
+void viewer_play_forward(Viewer *self)
+{
+    if (!self) return;
+    /* Cached multi-frame path */
+    if (self->anim_frames && self->anim_frames->len > 1) {
+        if (self->anim_timeout_id > 0) {
+            g_source_remove(self->anim_timeout_id);
+            self->anim_timeout_id = 0;
+        }
+        self->anim_play_forward = TRUE;
+        guint delay = 100;
+        if (self->anim_frame_delays && self->anim_frame_delays->len > 0)
+            delay = g_array_index(self->anim_frame_delays, guint, self->anim_current_frame);
+        g_info("viewer_play_forward: start cache timer frame=%d delay=%u", self->anim_current_frame, delay);
+        self->anim_timeout_id = g_timeout_add(delay, anim_cache_tick, self);
+        return;
+    }
+
+    /* Iterator-driven fallback */
+    if (self->anim_iter) {
+        if (self->anim_timeout_id > 0) {
+            g_source_remove(self->anim_timeout_id);
+            self->anim_timeout_id = 0;
+        }
+        /* Rewind iterator so replay always starts clean and timing is refreshed. */
+        g_clear_object(&self->anim_iter);
+        if (self->animation)
+            self->anim_iter = gdk_pixbuf_animation_get_iter(self->animation, NULL);
+
+        if (self->anim_iter) {
+            GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
+            if (frame) handle_loaded_pixbuf(self, g_object_ref(frame));
+
+            int delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
+            if (delay <= 0) delay = 100;
+            self->anim_timeout_id = g_timeout_add((guint)delay, animation_tick, self);
+        }
+    }
+}
+
+void viewer_play_backward(Viewer *self)
+{
+    if (!self) return;
+    if (!self->anim_frames || self->anim_frames->len == 0) return;
+    if (self->anim_timeout_id > 0) {
+        g_source_remove(self->anim_timeout_id);
+        self->anim_timeout_id = 0;
+    }
+    self->anim_play_forward = FALSE;
+    guint delay = 100;
+    if (self->anim_frame_delays && self->anim_frame_delays->len > 0)
+        delay = g_array_index(self->anim_frame_delays, guint, self->anim_current_frame);
+    g_info("viewer_play_backward: start cache timer frame=%d delay=%u", self->anim_current_frame, delay);
+    self->anim_timeout_id = g_timeout_add(delay, anim_cache_tick, self);
+}
+
+void viewer_step_forward(Viewer *self)
+{
+    if (!self) return;
+    /* Cached multi-frame path */
+    if (self->anim_frames && self->anim_frames->len > 1) {
+        if (self->anim_timeout_id > 0) {
+            g_source_remove(self->anim_timeout_id);
+            self->anim_timeout_id = 0;
+        }
+        int n = (int)self->anim_frames->len;
+        self->anim_current_frame = (self->anim_current_frame + 1) % n;
+        display_anim_frame(self, self->anim_current_frame);
+        return;
+    }
+
+    /* Iterator-driven fallback: advance iterator once */
+    if (self->anim_iter) {
+        if (self->anim_timeout_id > 0) {
+            g_source_remove(self->anim_timeout_id);
+            self->anim_timeout_id = 0;
+        }
+        GTimeVal tv;
+        g_get_current_time(&tv);
+        gboolean advanced = gdk_pixbuf_animation_iter_advance(self->anim_iter, &tv);
+        if (advanced) {
+            GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
+            if (frame) handle_loaded_pixbuf(self, g_object_ref(frame));
+        }
+    }
+}
+
+void viewer_step_backward(Viewer *self)
+{
+    if (!self) return;
+    if (!self->anim_frames || self->anim_frames->len == 0) return;
+    if (self->anim_timeout_id > 0) {
+        g_source_remove(self->anim_timeout_id);
+        self->anim_timeout_id = 0;
+    }
+    int n = (int)self->anim_frames->len;
+    self->anim_current_frame = (self->anim_current_frame - 1 + n) % n;
+    display_anim_frame(self, self->anim_current_frame);
+}
+
+void viewer_stop_animation_playback(Viewer *self)
+{
+    if (!self) return;
+    if (self->anim_timeout_id > 0) {
+        g_source_remove(self->anim_timeout_id);
+        self->anim_timeout_id = 0;
+    }
+    /* keep frames cached but stop timer */
 }
 
 /* Internal helper that applies a loaded pixbuf to the viewer. Factored out
@@ -858,6 +1101,429 @@ on_archive_entry_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
                                      on_pixbuf_loaded, 
                                      ctx);
     g_object_unref(mem);
+}
+
+static void stop_animation(Viewer *self)
+{
+    if (!self) return;
+    if (self->anim_timeout_id > 0) {
+        g_source_remove(self->anim_timeout_id);
+        self->anim_timeout_id = 0;
+    }
+    if (self->anim_iter) {
+        g_object_unref(self->anim_iter);
+        self->anim_iter = NULL;
+    }
+    if (self->animation) {
+        g_clear_object(&self->animation);
+    }
+    /* Clear any cached frames */
+    if (self->anim_frames) {
+        g_ptr_array_free(self->anim_frames, TRUE);
+        self->anim_frames = NULL;
+    }
+    if (self->anim_frame_delays) {
+        g_array_free(self->anim_frame_delays, TRUE);
+        self->anim_frame_delays = NULL;
+    }
+    self->anim_current_frame = 0;
+    self->anim_play_forward = TRUE;
+    /* Disable GIF control buttons when animation stops */
+    if (self->gif_play_forward_btn) gtk_widget_set_sensitive(self->gif_play_forward_btn, FALSE);
+    if (self->gif_play_backward_btn) gtk_widget_set_sensitive(self->gif_play_backward_btn, FALSE);
+    if (self->gif_step_forward_btn) gtk_widget_set_sensitive(self->gif_step_forward_btn, FALSE);
+    if (self->gif_step_backward_btn) gtk_widget_set_sensitive(self->gif_step_backward_btn, FALSE);
+    if (self->gif_stop_btn) gtk_widget_set_sensitive(self->gif_stop_btn, FALSE);
+}
+
+static gboolean animation_tick(gpointer user_data)
+{
+    Viewer *self = VIEWER(user_data);
+    if (!self || !self->anim_iter) return G_SOURCE_REMOVE;
+    /* Advance iterator using real time to avoid freezing after manual controls. */
+    GTimeVal tv;
+    g_get_current_time(&tv);
+    gboolean advanced = gdk_pixbuf_animation_iter_advance(self->anim_iter, &tv);
+    if (advanced) {
+        GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
+        if (frame) {
+            handle_loaded_pixbuf(self, g_object_ref(frame));
+        }
+    }
+
+    int delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
+    if (delay <= 0) delay = 100;
+    self->anim_timeout_id = g_timeout_add((guint)delay, animation_tick, self);
+    return G_SOURCE_REMOVE;
+}
+
+/* New: tick function for frame-cache driven playback (supports forward/back/step) */
+static gboolean
+anim_cache_tick(gpointer user_data)
+{
+    Viewer *self = VIEWER(user_data);
+    if (!self || !self->anim_frames || self->anim_frames->len == 0) return G_SOURCE_REMOVE;
+
+    int n = (int)self->anim_frames->len;
+    if (self->anim_play_forward) {
+        self->anim_current_frame = (self->anim_current_frame + 1) % n;
+    } else {
+        self->anim_current_frame = (self->anim_current_frame - 1 + n) % n;
+    }
+
+    GdkPixbuf *frame = g_ptr_array_index(self->anim_frames, self->anim_current_frame);
+    if (frame) {
+        handle_loaded_pixbuf(self, g_object_ref(frame));
+    }
+
+    /* schedule next tick using stored delay if available */
+    guint delay = 100;
+    if (self->anim_frame_delays && self->anim_frame_delays->len > 0) {
+        guint val = g_array_index(self->anim_frame_delays, guint, self->anim_current_frame);
+        if (val > 0) delay = val;
+    }
+
+    g_info("anim_cache_tick: dir=%s frame=%d/%d delay=%u", self->anim_play_forward ? "fwd" : "rev", self->anim_current_frame, n, delay);
+    self->anim_timeout_id = g_timeout_add(delay, anim_cache_tick, self);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+display_anim_frame(Viewer *self, int idx)
+{
+    if (!self || !self->anim_frames) return;
+    if (idx < 0 || idx >= (int)self->anim_frames->len) return;
+    GdkPixbuf *frame = g_ptr_array_index(self->anim_frames, idx);
+    if (!frame) return;
+    self->anim_current_frame = idx;
+    handle_loaded_pixbuf(self, g_object_ref(frame));
+}
+
+/* Diagnostic: log allocation and visibility info for GIF controls and overlay.
+ * Called after making the controls visible so we can capture runtime sizes.
+ */
+static void
+log_gif_control_allocs(Viewer *self)
+{
+    if (!self) return;
+    int w, h;
+    const char *name = "(null)";
+
+    if (self->video_controls_overlay) {
+        w = gtk_widget_get_width(self->video_controls_overlay);
+        h = gtk_widget_get_height(self->video_controls_overlay);
+        g_info("GIF alloc: video_controls_overlay size=%dx%d visible=%d", w, h, (int)gtk_widget_get_visible(self->video_controls_overlay));
+    }
+
+    if (self->gif_play_forward_btn) {
+        w = gtk_widget_get_width(self->gif_play_forward_btn);
+        h = gtk_widget_get_height(self->gif_play_forward_btn);
+        g_info("GIF alloc: play_forward size=%dx%d visible=%d sensitive=%d", w, h,
+               (int)gtk_widget_get_visible(self->gif_play_forward_btn), (int)gtk_widget_get_sensitive(self->gif_play_forward_btn));
+    }
+    if (self->gif_play_backward_btn) {
+        w = gtk_widget_get_width(self->gif_play_backward_btn);
+        h = gtk_widget_get_height(self->gif_play_backward_btn);
+        g_info("GIF alloc: play_backward size=%dx%d visible=%d sensitive=%d", w, h,
+               (int)gtk_widget_get_visible(self->gif_play_backward_btn), (int)gtk_widget_get_sensitive(self->gif_play_backward_btn));
+    }
+    if (self->gif_step_forward_btn) {
+        w = gtk_widget_get_width(self->gif_step_forward_btn);
+        h = gtk_widget_get_height(self->gif_step_forward_btn);
+        g_info("GIF alloc: step_forward size=%dx%d visible=%d sensitive=%d", w, h,
+               (int)gtk_widget_get_visible(self->gif_step_forward_btn), (int)gtk_widget_get_sensitive(self->gif_step_forward_btn));
+    }
+    if (self->gif_step_backward_btn) {
+        w = gtk_widget_get_width(self->gif_step_backward_btn);
+        h = gtk_widget_get_height(self->gif_step_backward_btn);
+        g_info("GIF alloc: step_backward size=%dx%d visible=%d sensitive=%d", w, h,
+               (int)gtk_widget_get_visible(self->gif_step_backward_btn), (int)gtk_widget_get_sensitive(self->gif_step_backward_btn));
+    }
+    if (self->gif_stop_btn) {
+        w = gtk_widget_get_width(self->gif_stop_btn);
+        h = gtk_widget_get_height(self->gif_stop_btn);
+        g_info("GIF alloc: stop size=%dx%d visible=%d sensitive=%d", w, h,
+               (int)gtk_widget_get_visible(self->gif_stop_btn), (int)gtk_widget_get_sensitive(self->gif_stop_btn));
+    }
+}
+
+/* Idle wrapper so we run the alloc logging after layout/allocation settles. */
+static gboolean
+log_gif_control_allocs_idle(gpointer user_data)
+{
+    Viewer *self = VIEWER(user_data);
+    log_gif_control_allocs(self);
+    return G_SOURCE_REMOVE;
+}
+
+/* Automation helper: when BRIGHTEYES_AUTOMATE_GIF_CONTROLS=1, exercise GIF controls
+ * automatically to produce handler log lines for testing. This emits "clicked"
+ * on the forward-play button, then step-forward, then stop with small delays.
+ */
+typedef struct {
+    Viewer *self;
+    int step;
+} AutoGifCtx;
+
+static gboolean
+automation_step_cb(gpointer user_data)
+{
+    AutoGifCtx *ctx = (AutoGifCtx *)user_data;
+    Viewer *self = ctx->self;
+
+    switch (ctx->step) {
+    case 0:
+        if (self->gif_play_forward_btn) {
+            g_info("automation: emitting play_forward clicked");
+            g_signal_emit_by_name(self->gif_play_forward_btn, "clicked");
+        }
+        break;
+    case 1:
+        if (self->gif_step_forward_btn) {
+            g_info("automation: emitting step_forward clicked");
+            g_signal_emit_by_name(self->gif_step_forward_btn, "clicked");
+        }
+        break;
+    case 2:
+        if (self->gif_stop_btn) {
+            g_info("automation: emitting stop clicked");
+            g_signal_emit_by_name(self->gif_stop_btn, "clicked");
+        }
+        break;
+    default:
+        if (ctx->self) g_object_unref(ctx->self);
+        g_free(ctx);
+        return G_SOURCE_REMOVE;
+    }
+
+    ctx->step++;
+    /* schedule next step after 400ms */
+    g_timeout_add(400, automation_step_cb, ctx);
+    return G_SOURCE_REMOVE;
+}
+
+static void
+on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+    LoadCtx *ctx = (LoadCtx *)user_data;
+    Viewer *self = VIEWER(ctx->self);
+    GError *err = NULL;
+    GdkPixbufAnimation *anim = gdk_pixbuf_animation_new_from_stream_finish(res, &err);
+
+    if (ctx->load_seq != self->load_seq) {
+        if (anim) g_object_unref(anim);
+        g_clear_error(&err);
+        load_ctx_free(ctx);
+        return;
+    }
+
+    if (!anim) {
+        g_warning("Failed to load animation: %s", err ? err->message : "unknown error");
+        g_clear_error(&err);
+        load_ctx_free(ctx);
+        return;
+    }
+
+    /* Stop any prior animation */
+    stop_animation(self);
+
+    self->animation = g_object_ref(anim);
+    g_info("on_animation_loaded: animation object loaded");
+    /* Create iter and display first frame */
+    self->anim_iter = gdk_pixbuf_animation_get_iter(self->animation, NULL);
+    if (self->anim_iter) {
+        /* Try to build a lightweight frame cache for accurate stepping and
+         * reverse playback. We iterate the animation iterator for up to a
+         * reasonable frame limit and stop if we detect we've looped back to
+         * the first frame. If caching fails, fall back to iterator-driven
+         * playback. */
+        self->anim_frames = g_ptr_array_new_with_free_func(g_object_unref);
+        self->anim_frame_delays = g_array_new(FALSE, FALSE, sizeof(guint));
+
+        /* Deep-copy frames so we can step/reverse even when the iterator reuses
+         * the same underlying pixbuf pointer. Detect loop by comparing to the
+         * first frame's pixel data. */
+        GdkPixbuf *first = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
+        guint first_delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
+        if (first_delay <= 0) first_delay = 100;
+
+        if (first) {
+            GdkPixbuf *first_copy = gdk_pixbuf_copy(first);
+            if (first_copy) {
+                g_ptr_array_add(self->anim_frames, first_copy);
+                g_array_append_val(self->anim_frame_delays, first_delay);
+            }
+        }
+
+        gboolean saw_unique_frame = FALSE;
+        const guint MAX_FRAMES = 1000;
+        /* Advance the iterator using simulated time so we collect distinct frames even
+         * when iter_advance requires monotonically increasing timestamps. */
+        gint64 sim_time_us = g_get_real_time();
+        guint prev_delay = first_delay;
+        for (guint i = 1; i < MAX_FRAMES; i++) {
+            sim_time_us += ((gint64)prev_delay) * 1000;
+            GTimeVal tv = { sim_time_us / G_USEC_PER_SEC, sim_time_us % G_USEC_PER_SEC };
+
+            if (!gdk_pixbuf_animation_iter_advance(self->anim_iter, &tv)) break;
+
+            GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
+            if (!frame) break;
+
+            guint delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
+            if (delay <= 0) delay = 100;
+            prev_delay = delay;
+
+            /* Detect loop only after we've observed at least one unique frame.
+             * Some GIFs repeat the first frame before advancing; if we break
+             * on that repeat we would cache just a single frame. */
+            if (frame == first && saw_unique_frame) {
+                gboolean same_as_first = FALSE;
+                if (self->anim_frames->len > 0) {
+                    GdkPixbuf *first_cached = g_ptr_array_index(self->anim_frames, 0);
+                    int width = gdk_pixbuf_get_width(frame);
+                    int height = gdk_pixbuf_get_height(frame);
+                    int stride = gdk_pixbuf_get_rowstride(frame);
+                    if (width == gdk_pixbuf_get_width(first_cached) &&
+                        height == gdk_pixbuf_get_height(first_cached) &&
+                        stride == gdk_pixbuf_get_rowstride(first_cached) &&
+                        gdk_pixbuf_get_n_channels(frame) == gdk_pixbuf_get_n_channels(first_cached)) {
+                        gsize bytes = (gsize)stride * (gsize)height;
+                        const guchar *p_first = gdk_pixbuf_read_pixels(first_cached);
+                        const guchar *p_frame = gdk_pixbuf_read_pixels(frame);
+                        if (p_first && p_frame && bytes > 0) {
+                            same_as_first = (memcmp(p_first, p_frame, bytes) == 0);
+                        }
+                    }
+                }
+                if (same_as_first) break;
+            }
+
+            GdkPixbuf *copy = gdk_pixbuf_copy(frame);
+            if (!copy) break;
+
+            g_ptr_array_add(self->anim_frames, copy);
+            g_array_append_val(self->anim_frame_delays, delay);
+            if (!saw_unique_frame && self->anim_frames->len > 1) {
+                GdkPixbuf *first_cached = g_ptr_array_index(self->anim_frames, 0);
+                int width = gdk_pixbuf_get_width(frame);
+                int height = gdk_pixbuf_get_height(frame);
+                int stride = gdk_pixbuf_get_rowstride(frame);
+                gboolean same_as_first = FALSE;
+                if (width == gdk_pixbuf_get_width(first_cached) &&
+                    height == gdk_pixbuf_get_height(first_cached) &&
+                    stride == gdk_pixbuf_get_rowstride(first_cached) &&
+                    gdk_pixbuf_get_n_channels(frame) == gdk_pixbuf_get_n_channels(first_cached)) {
+                    gsize bytes = (gsize)stride * (gsize)height;
+                    const guchar *p_first = gdk_pixbuf_read_pixels(first_cached);
+                    const guchar *p_frame = gdk_pixbuf_read_pixels(frame);
+                    if (p_first && p_frame && bytes > 0) {
+                        same_as_first = (memcmp(p_first, p_frame, bytes) == 0);
+                    }
+                }
+                if (!same_as_first) saw_unique_frame = TRUE;
+            }
+        }
+
+        /* Display first cached frame */
+        guint nframes = (guint)self->anim_frames->len;
+        g_info("on_animation_loaded: cached %u frames", nframes);
+        /* Require more than one cached frame to enable cache-driven playback.
+         * If only a single frame was cached, fall back to iterator-driven
+         * playback so that animations which reuse the same GdkPixbuf pointer
+         * across logical frames still animate correctly. */
+        if (nframes > 1) {
+            display_anim_frame(self, 0);
+            /* Enable GIF controls */
+            if (self->gif_play_forward_btn) gtk_widget_set_sensitive(self->gif_play_forward_btn, TRUE);
+            if (self->gif_play_backward_btn) gtk_widget_set_sensitive(self->gif_play_backward_btn, TRUE);
+            if (self->gif_step_forward_btn) gtk_widget_set_sensitive(self->gif_step_forward_btn, TRUE);
+            if (self->gif_step_backward_btn) gtk_widget_set_sensitive(self->gif_step_backward_btn, TRUE);
+            if (self->gif_stop_btn) gtk_widget_set_sensitive(self->gif_stop_btn, TRUE);
+
+                 /* Diagnostic: log widget visibility/sensitivity to ensure UI is interactive */
+                 g_info("GIF controls: play_forward visible=%d sensitive=%d",
+                     (int)gtk_widget_get_visible(self->gif_play_forward_btn),
+                     (int)gtk_widget_get_sensitive(self->gif_play_forward_btn));
+                 g_info("GIF controls: play_backward visible=%d sensitive=%d",
+                     (int)gtk_widget_get_visible(self->gif_play_backward_btn),
+                     (int)gtk_widget_get_sensitive(self->gif_play_backward_btn));
+                 g_info("GIF controls: step_forward visible=%d sensitive=%d",
+                     (int)gtk_widget_get_visible(self->gif_step_forward_btn),
+                     (int)gtk_widget_get_sensitive(self->gif_step_forward_btn));
+                 g_info("GIF controls: step_backward visible=%d sensitive=%d",
+                     (int)gtk_widget_get_visible(self->gif_step_backward_btn),
+                     (int)gtk_widget_get_sensitive(self->gif_step_backward_btn));
+
+            /* Show the controls overlay and hide video-only widgets */
+            if (self->video_controls_overlay) gtk_widget_set_visible(self->video_controls_overlay, TRUE);
+            if (self->seek_scale) gtk_widget_set_visible(self->seek_scale, FALSE);
+            if (self->volume_btn) gtk_widget_set_visible(self->volume_btn, FALSE);
+            if (self->volume_scale) gtk_widget_set_visible(self->volume_scale, FALSE);
+            /* Set play/pause icon to pause when starting playback */
+            if (self->play_pause_btn) gtk_button_set_icon_name(GTK_BUTTON(self->play_pause_btn), "media-playback-pause-symbolic");
+
+            /* Start cache-driven playback by default (forward) */
+            self->anim_play_forward = TRUE;
+            guint start_delay = g_array_index(self->anim_frame_delays, guint, 0);
+            g_info("on_animation_loaded: starting cache-driven playback (delay=%u ms)", start_delay);
+            self->anim_timeout_id = g_timeout_add(start_delay, anim_cache_tick, self);
+            /* Log allocations after layout settles */
+            g_idle_add(log_gif_control_allocs_idle, self);
+            /* Optional automation for testing: exercises GIF controls when env var set */
+            if (g_getenv("BRIGHTEYES_AUTOMATE_GIF_CONTROLS")) {
+                AutoGifCtx *actx = g_new0(AutoGifCtx, 1);
+                actx->self = g_object_ref(self);
+                actx->step = 0;
+                g_timeout_add(600, automation_step_cb, actx);
+            }
+        } else {
+            /* Fallback to iterator-driven playback
+             * Ensure the player controls are visible so the user can still
+             * stop/play or step (where supported) even when a full frame
+             * cache wasn't available. Some actions (reverse/step-back)
+             * may not be meaningful with iterator-driven playback; leave
+             * them disabled in that case. */
+            GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
+            if (frame) {
+                handle_loaded_pixbuf(self, g_object_ref(frame));
+            }
+
+            /* Enable primary controls: play/stop and play-forward. Leave
+             * backward/step-back disabled unless we have a multi-frame cache. */
+            if (self->gif_play_forward_btn) gtk_widget_set_sensitive(self->gif_play_forward_btn, TRUE);
+            if (self->gif_play_backward_btn) gtk_widget_set_sensitive(self->gif_play_backward_btn, FALSE);
+            if (self->gif_step_forward_btn) gtk_widget_set_sensitive(self->gif_step_forward_btn, TRUE);
+            if (self->gif_step_backward_btn) gtk_widget_set_sensitive(self->gif_step_backward_btn, FALSE);
+            if (self->gif_stop_btn) gtk_widget_set_sensitive(self->gif_stop_btn, TRUE);
+
+            /* Diagnostic: log widget visibility/sensitivity */
+            g_info("GIF controls (iterator): play_forward visible=%d sensitive=%d",
+                   (int)gtk_widget_get_visible(self->gif_play_forward_btn),
+                   (int)gtk_widget_get_sensitive(self->gif_play_forward_btn));
+
+            if (self->video_controls_overlay) gtk_widget_set_visible(self->video_controls_overlay, TRUE);
+            /* Log allocations after layout settles (iterator fallback) */
+            g_idle_add(log_gif_control_allocs_idle, self);
+            /* Optional automation for testing: exercises GIF controls when env var set */
+            if (g_getenv("BRIGHTEYES_AUTOMATE_GIF_CONTROLS")) {
+                AutoGifCtx *actx = g_new0(AutoGifCtx, 1);
+                actx->self = g_object_ref(self);
+                actx->step = 0;
+                g_timeout_add(600, automation_step_cb, actx);
+            }
+            if (self->seek_scale) gtk_widget_set_visible(self->seek_scale, FALSE);
+            if (self->volume_btn) gtk_widget_set_visible(self->volume_btn, FALSE);
+            if (self->volume_scale) gtk_widget_set_visible(self->volume_scale, FALSE);
+            if (self->play_pause_btn) gtk_button_set_icon_name(GTK_BUTTON(self->play_pause_btn), "media-playback-pause-symbolic");
+
+            g_info("on_animation_loaded: falling back to iterator-driven playback");
+            self->anim_timeout_id = g_timeout_add(100, animation_tick, self);
+        }
+    }
+
+    g_object_unref(anim);
+    load_ctx_free(ctx);
 }
 
 static void
@@ -1059,6 +1725,27 @@ viewer_load_file(Viewer *self, const char *path)
         g_debug("File detected as image.");
         /* Load image */
         viewer_stop_playback(self);
+        /* Stop any running GIF animation */
+        stop_animation(self);
+
+        /* If GIF, try loading as animation to support animated GIFs */
+        if (ext && g_ascii_strcasecmp(ext, ".gif") == 0) {
+            GFile *file = g_file_new_for_path(path);
+            LoadCtx *ctx = load_ctx_new(self, load_seq);
+            /* Read into stream and use animation async loader. Avoid calling
+             * g_file_read_async with a NULL callback (previous stray call);
+             * use synchronous open then async animation loader on the stream. */
+            GFileInputStream *stream = g_file_read(file, NULL, NULL);
+            if (stream) {
+                /* Create memory stream wrapper by reading into memory asynchronously is complex; instead use animation loader from stream synchronously via g_input_stream */
+                gdk_pixbuf_animation_new_from_stream_async(G_INPUT_STREAM(stream), self->load_cancellable, on_animation_loaded, ctx);
+                g_object_unref(stream);
+                g_object_unref(file);
+                return;
+            }
+            g_object_unref(file);
+            /* Fall through to regular pixbuf load if stream couldn't be opened */
+        }
         
         GFile *file = g_file_new_for_path(path);
         LoadCtx *ctx = load_ctx_new(self, load_seq);

@@ -28,6 +28,16 @@ static void delete_current_now(BrightEyesWindow *self);
 static void on_next_clicked(GtkButton *btn, BrightEyesWindow *self);
 static void on_playback_changed(Viewer *viewer, gboolean playing, BrightEyesWindow *self);
 
+/* Curator current change handler */
+static void on_curator_current_changed(Curator *curator, BrightEyesWindow *self);
+
+/* Menu updater: rebuilds the cheeseburger menu based on current path */
+static void update_main_menu(BrightEyesWindow *self, const char *path);
+
+/* Helpers for remembering user declines for CBR->CBZ prompts */
+static gboolean previously_declined_cbr(const char *path);
+static void record_declined_cbr(const char *path);
+
 static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const char *tmp_path);
 struct _BrightEyesWindow {
     AdwApplicationWindow parent_instance;
@@ -39,6 +49,7 @@ struct _BrightEyesWindow {
     AdwOverlaySplitView *metadata_view; /* Metadata (Inner) */
     GtkWidget *toast_overlay; /* Added toast overlay */
     GtkWidget *metadata_sidebar;
+    GtkWidget *menu_btn;
     guint slideshow_id;
     guint slideshow_duration;
     GtkWidget *slideshow_btn;
@@ -335,6 +346,10 @@ load_image_path(BrightEyesWindow *self, const char *path)
         GAction *act = g_action_map_lookup_action(G_ACTION_MAP(self->win_actions), "convert-to-cbz");
         if (act) g_simple_action_set_enabled(G_SIMPLE_ACTION(act), can_convert);
     }
+    /* Rebuild top-level menu so the cheeseburger shows Convert-to-CBZ only
+     * when viewing a .cbr archive (we place it at the top when present).
+     */
+    update_main_menu(self, path);
 }
 
 static void
@@ -343,6 +358,14 @@ on_viewer_zoom_changed(Viewer *viewer, guint percentage, BrightEyesWindow *self)
     char *text = g_strdup_printf("Zoom: %u%%", percentage);
     gtk_label_set_text(GTK_LABEL(self->status_label), text);
     g_free(text);
+}
+
+static void
+on_curator_current_changed(Curator *curator, BrightEyesWindow *self)
+{
+    (void)curator;
+    const char *current = curator_get_current(self->curator);
+    update_main_menu(self, current);
 }
 
 static void
@@ -1410,6 +1433,44 @@ on_convert_cbz_finished(GObject *source_object, GAsyncResult *res, gpointer user
     }
 }
 
+/* Build the main cheeseburger menu. If `path` refers to a CBR archive being
+ * viewed (archive://... with a .cbr extension) the "Convert to CBZ" entry
+ * will be added at the top. Otherwise it is omitted.
+ */
+static void
+update_main_menu(BrightEyesWindow *self, const char *path)
+{
+    if (!self || !self->menu_btn) return;
+
+    GMenu *menu = g_menu_new();
+
+    gboolean is_cbr = FALSE;
+    if (path && g_str_has_prefix(path, "archive://")) {
+        const char *sep = strstr(path, "::");
+        if (sep) {
+            size_t len = sep - (path + strlen("archive://"));
+            char *arch = g_strndup(path + strlen("archive://"), len);
+            if (arch) {
+                if (g_str_has_suffix(arch, ".cbr") || g_str_has_suffix(arch, ".CBR"))
+                    is_cbr = TRUE;
+                g_free(arch);
+            }
+        }
+    }
+
+    if (is_cbr) {
+        /* Put Convert at the top */
+        g_menu_append(menu, "Convert to CBZ", "win.convert-to-cbz");
+    }
+
+    g_menu_append(menu, "Preferences", "win.preferences");
+    g_menu_append(menu, "Keyboard Shortcuts", "win.shortcuts");
+    g_menu_append(menu, "About BrightEyes", "win.about");
+
+    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(self->menu_btn), G_MENU_MODEL(menu));
+    g_object_unref(menu);
+}
+
 static void
 start_conversion_task(BrightEyesWindow *self, const char *path)
 {
@@ -1454,6 +1515,9 @@ on_cbr_prompt_response(AdwAlertDialog *dlg, const char *response, gpointer user_
     
     if (g_strcmp0(response, "convert") == 0) {
         start_conversion_task(self, path);
+    } else if (g_strcmp0(response, "cancel") == 0) {
+        /* User declined conversion for this file; remember and don't prompt again */
+        record_declined_cbr(path);
     }
 }
 
@@ -1465,6 +1529,8 @@ check_cbr_prompt(BrightEyesWindow *self, const char *path)
     if (!ext) return;
     
     if (g_ascii_strcasecmp(ext, ".cbr") == 0) {
+        /* If the user previously declined conversion for this exact path, skip prompting */
+        if (previously_declined_cbr(path)) return;
         AdwAlertDialog *dlg = ADW_ALERT_DIALOG(adw_alert_dialog_new(
             "Convert to CBZ?",
             "This is a RAR (CBR) archive. Note: You cannot delete pages from CBR files. Would you like to convert it to Zip (CBZ) format?"
@@ -1570,6 +1636,91 @@ get_config_path(void)
     char *path = g_build_filename(dir, "config.ini", NULL);
     g_free(dir);
     return path;
+}
+
+/* Remember files for which the user declined CBR->CBZ conversion.
+ * Stored in the same config file under group 'CbrPrompt' key 'declined'.
+ */
+static gboolean
+previously_declined_cbr(const char *path)
+{
+    if (!path) return FALSE;
+    char *cfg = get_config_path();
+    GKeyFile *kf = g_key_file_new();
+    GError *err = NULL;
+    gboolean found = FALSE;
+
+    if (g_key_file_load_from_file(kf, cfg, G_KEY_FILE_NONE, &err)) {
+        gsize len = 0;
+        gchar **list = g_key_file_get_string_list(kf, "CbrPrompt", "declined", &len, NULL);
+        if (list) {
+            for (gsize i = 0; i < len; i++) {
+                if (g_strcmp0(list[i], path) == 0) {
+                    found = TRUE;
+                    break;
+                }
+            }
+            g_strfreev(list);
+        }
+    } else {
+        g_clear_error(&err);
+    }
+
+    g_key_file_free(kf);
+    g_free(cfg);
+    return found;
+}
+
+static void
+record_declined_cbr(const char *path)
+{
+    if (!path) return;
+    char *cfg = get_config_path();
+    GKeyFile *kf = g_key_file_new();
+    GError *err = NULL;
+
+    /* Load existing file if present, otherwise we'll create a fresh keyfile */
+    g_key_file_load_from_file(kf, cfg, G_KEY_FILE_NONE, NULL);
+
+    /* Get current list */
+    gsize len = 0;
+    gchar **list = g_key_file_get_string_list(kf, "CbrPrompt", "declined", &len, NULL);
+
+    /* Check for existing entry */
+    for (gsize i = 0; list && list[i]; i++) {
+        if (g_strcmp0(list[i], path) == 0) {
+            g_strfreev(list);
+            g_key_file_free(kf);
+            g_free(cfg);
+            return; /* already recorded */
+        }
+    }
+
+    /* Build new list (existing + new) */
+    gchar **new_list = NULL;
+    if (list) {
+        new_list = g_new0(gchar *, len + 2);
+        for (gsize i = 0; i < len; i++) new_list[i] = g_strdup(list[i]);
+        new_list[len] = g_strdup(path);
+        new_list[len+1] = NULL;
+        g_strfreev(list);
+    } else {
+        new_list = g_new0(gchar *, 2);
+        new_list[0] = g_strdup(path);
+        new_list[1] = NULL;
+    }
+
+    g_key_file_set_string_list(kf, "CbrPrompt", "declined", (const gchar * const *)new_list, (gssize)(g_strv_length(new_list)));
+
+    /* Save back to disk */
+    if (!g_key_file_save_to_file(kf, cfg, &err)) {
+        g_warning("Failed to save CBR prompt state: %s", err ? err->message : "unknown");
+        g_clear_error(&err);
+    }
+
+    g_strfreev(new_list);
+    g_key_file_free(kf);
+    g_free(cfg);
 }
 
 static void
@@ -2113,6 +2264,8 @@ static void
 bright_eyes_window_init(BrightEyesWindow *self)
 {
     self->curator = curator_new();
+    /* Update menu when curator's current item changes elsewhere */
+    g_signal_connect(self->curator, "current-changed", G_CALLBACK(on_curator_current_changed), self);
     self->slideshow_id = 0;    self->slideshow_duration = 3;
     self->ocr_language = g_strdup("eng");
     self->viewer_dark_background = TRUE;
@@ -2289,19 +2442,14 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_widget_insert_action_group(GTK_WIDGET(self), "win", G_ACTION_GROUP(actions));
     g_object_unref(actions);
     
-    GMenu *menu = g_menu_new();
-    g_menu_append(menu, "Convert to CBZ", "win.convert-to-cbz");
-    g_menu_append(menu, "Preferences", "win.preferences");
-    g_menu_append(menu, "Keyboard Shortcuts", "win.shortcuts");
-    g_menu_append(menu, "About BrightEyes", "win.about");
-
     /* Cheeseburger / Menu Button */
     GtkWidget *menu_btn = gtk_menu_button_new();
-    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(menu_btn), G_MENU_MODEL(menu));
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_btn), "open-menu-symbolic");
     gtk_widget_set_tooltip_text(menu_btn, "Main Menu");
     adw_header_bar_pack_end(ADW_HEADER_BAR(header), menu_btn);
-    g_object_unref(menu);
+    /* Store the button on the window and build the initial menu (no file loaded yet) */
+    self->menu_btn = menu_btn;
+    update_main_menu(self, NULL);
     
     /* Metadata Button (next to menu) */
     GtkWidget *metadata_btn = gtk_button_new_from_icon_name("emoji-objects-symbolic");

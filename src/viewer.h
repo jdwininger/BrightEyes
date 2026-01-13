@@ -29,6 +29,13 @@ void viewer_set_dark_background(Viewer *self, gboolean dark);
 /* Configure default fit mode when loading a new image. */
 void viewer_set_default_fit(Viewer *self, gboolean fit);
 
+/* Animated GIF playback controls */
+void viewer_play_forward(Viewer *self);
+void viewer_play_backward(Viewer *self);
+void viewer_step_forward(Viewer *self);
+void viewer_step_backward(Viewer *self);
+void viewer_stop_animation_playback(Viewer *self);
+
 guint viewer_get_zoom_level_percentage(Viewer *self);
 
 void viewer_set_fit_to_width(Viewer *self);

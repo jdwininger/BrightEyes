@@ -21,6 +21,13 @@ struct _Curator {
 
 G_DEFINE_TYPE(Curator, curator, G_TYPE_OBJECT)
 
+/* Signals */
+enum {
+    CURATOR_SIGNAL_CURRENT_CHANGED,
+    CURATOR_N_SIGNALS
+};
+static guint curator_signals[CURATOR_N_SIGNALS] = { 0 };
+
 static void
 curator_dispose(GObject *object)
 {
@@ -50,6 +57,18 @@ curator_class_init(CuratorClass *klass)
     GObjectClass *object_class = G_OBJECT_CLASS(klass);
     object_class->dispose = curator_dispose;
     object_class->finalize = curator_finalize;
+
+    /* Notify listeners when the current item changes */
+    curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED] = g_signal_new(
+        "current-changed",
+        G_TYPE_FROM_CLASS(klass),
+        G_SIGNAL_RUN_FIRST,
+        0,
+        NULL, NULL,
+        NULL,
+        G_TYPE_NONE,
+        0
+    );
 }
 
 static void
@@ -168,6 +187,8 @@ curator_set_current_file(Curator *self, const char *filepath)
                         g_ptr_array_add(self->files, virtual);
                     }
                     self->current_index = 0;
+                    /* Emit signal to notify listeners of the change */
+                    g_signal_emit(self, curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED], 0);
                 } else {
                     g_warning("Failed to read archive '%s': %s", self->current_directory, err ? err->message : "unknown");
                     g_clear_error(&err);
@@ -197,6 +218,8 @@ curator_set_current_file(Curator *self, const char *filepath)
                 g_ptr_array_add(self->files, virtual);
             }
             self->current_index = 0;
+            /* Emit signal to notify listeners of the change */
+            g_signal_emit(self, curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED], 0);
         } else {
             g_warning("Failed to read archive '%s': %s", filepath, err ? err->message : "unknown");
             g_clear_error(&err);
@@ -221,6 +244,7 @@ curator_set_current_file(Curator *self, const char *filepath)
         const char *f = g_ptr_array_index(self->files, i);
         if (g_strcmp0(f, filepath) == 0) {
             self->current_index = i;
+            g_signal_emit(self, curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED], 0);
             return;
         }
     }
@@ -236,8 +260,9 @@ curator_set_current_file(Curator *self, const char *filepath)
         if (g_strcmp0(f_base, basename) == 0) {
              self->current_index = i;
              g_free(f_base);
-             g_free(basename);
-             return;
+            g_free(basename);
+            g_signal_emit(self, curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED], 0);
+            return;
         }
         g_free(f_base);
     }
@@ -266,6 +291,7 @@ curator_get_next(Curator *self)
     if (self->current_index >= (int)self->files->len) {
         self->current_index = 0; /* Loop */
     }
+    g_signal_emit(self, curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED], 0);
     return g_ptr_array_index(self->files, self->current_index);
 }
 
@@ -277,6 +303,7 @@ curator_get_prev(Curator *self)
     if (self->current_index < 0) {
         self->current_index = self->files->len - 1; /* Loop */
     }
+    g_signal_emit(self, curator_signals[CURATOR_SIGNAL_CURRENT_CHANGED], 0);
     return g_ptr_array_index(self->files, self->current_index);
 }
 
