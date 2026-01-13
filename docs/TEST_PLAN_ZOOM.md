@@ -1,5 +1,7 @@
 # Manual Test Plan: Zoom Functionality
 
+*(Updated for release **v0.2.0**) ✅*
+
 ## 1. Basic Zoom
 - [ ] Open an image.
 - [ ] Click "Zoom In" button.

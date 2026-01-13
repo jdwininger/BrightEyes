@@ -1,5 +1,5 @@
 Name:           brighteyes
-Version:        0.1
+Version:        0.2.0
 Release:        1%{?dist}
 Summary:        Image and simple video viewer
 
@@ -95,5 +95,7 @@ fi
 /usr/share/icons/hicolor/512x512/apps/org.jeremy.BrightEyes.png
 
 %changelog
+* Tue Jan 13 2026 Jeremy <jeremy@example.com> - 0.2.0-1
+- Add adwaita-icon-theme to DEB packaging and update documentation. 🚀🎉
 * Wed Jan 07 2026 Your Name <you@example.org> - 0.1-1
 - Initial package

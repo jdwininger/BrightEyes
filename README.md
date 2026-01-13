@@ -46,3 +46,8 @@ Note: RAR/CBR support depends on libarchive's available RAR support which can va
 There is a Flatpak manifest at `org.jeremy.BrightEyes.yml` at the repo root. I added CI to build a Flatpak bundle on push and on release and upload the bundle as an artifact.
 
 
+
+## 📦 Publishing
+
+- GitHub Releases: RPM and DEB artifacts are attached by CI.
+- 🚀 **Release v0.2.0 (2026-01-13)**: Added Debian dependency `adwaita-icon-theme`, improved packaging, and refreshed documentation. 🎉🛠️

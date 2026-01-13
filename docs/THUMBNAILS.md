@@ -1,5 +1,7 @@
 # Thumbnails — Improvements 🧭
 
+*Included in release **v0.2.0* 🚀*
+
 This project includes a small set of changes to improve thumbnail performance and correctness:
 
 - ✅ Debounced thumbnail loading (short delay for images, longer delay for videos to avoid churn while scrolling)
