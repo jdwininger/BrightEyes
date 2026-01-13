@@ -61,6 +61,7 @@ jobs:
             --depends "libgstreamer-plugins-base1.0-0" \
             --depends "libtesseract5" \
             --depends "libleptonica6" \
+            --depends "adwaita-icon-theme" \
             -C /tmp/package .
             
           mkdir -p artifacts
