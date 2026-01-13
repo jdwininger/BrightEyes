@@ -45,6 +45,7 @@ Requires: tesseract
 Requires:       libadwaita
 Requires:       gdk-pixbuf2
 Requires:       glib2
+Requires:       adwaita-icon-theme
 # If you enable media/ocr features at build time, the following may be needed at runtime
 # Requires:     gstreamer1
 # Requires:     tesseract
