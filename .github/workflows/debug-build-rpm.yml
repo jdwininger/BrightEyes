@@ -1,0 +1,45 @@
+name: Debug Build RPM
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  debug-rpm:
+    name: Debug Build RPM (Fedora container)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set VERSION
+        run: |
+          echo "VERSION=${{ github.sha }}" >> $GITHUB_ENV
+
+      - name: Build RPM inside Fedora container (debug)
+        uses: addnab/docker-run-action@v3
+        with:
+          image: fedora:latest
+          options: --rm -v ${{ github.workspace }}:/workspace -e VERSION=${{ env.VERSION }}
+          workdir: /workspace
+          run: |
+            set -euo pipefail
+            cd /workspace
+            dnf -y update
+            # Install build deps and packaging tools, including GStreamer devel packages
+            dnf -y install git meson ninja gcc pkgconfig gtk4-devel libadwaita-devel gdk-pixbuf2-devel \
+              gstreamer1-devel gstreamer1-plugins-base-devel \
+              tesseract-devel leptonica-devel libarchive-devel cmake rpm-build ruby rubygems make which
+            git config --global --add safe.directory /workspace
+            gem install --no-document fpm
+
+            # Build project
+            ls -la
+            rm -rf build || true
+            meson setup build .
+            meson compile -C build
+
+            # Print build tree and last 200 lines of build log if any
+            echo "--- Build tree ---"
+            ls -la build || true
+            echo "--- Ninja build output (last 200 lines) ---"
+            tail -n 200 build/meson-logs/meson-log.txt || true
