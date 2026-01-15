@@ -32,11 +32,7 @@ jobs:
             # Install build deps and packaging tools, including GStreamer devel packages
             dnf -y install git meson ninja gcc pkgconfig gtk4-devel libadwaita-devel gdk-pixbuf2-devel \
               gstreamer1-devel gstreamer1-plugins-base-devel \
-              tesseract-devel leptonica-devel rpm-build ruby rubygems make which
-            git config --global --add safe.directory /workspace
-            gem install --no-document fpm
-
-            # Build project
+        tesseract-devel leptonica-devel libarchive-devel cmake rpm-build ruby rubygems make which
             ls -la
             rm -rf build || true
             meson setup build .
