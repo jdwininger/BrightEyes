@@ -44,6 +44,8 @@ jobs:
             meson install -C build --destdir=/tmp/package
 
             # Build RPM from staged files with fpm
+            # Ensure VERSION is set (fallback to short git SHA when not provided)
+            VERSION="${VERSION:-$(git rev-parse --short HEAD)}"
             VERSION="${VERSION#v}"
             fpm -s dir -t rpm -n brighteyes -v "$VERSION" --license MIT \
                 --url "https://github.com/jdwininger/BrightEyes" \
