@@ -45,16 +45,22 @@ int main(int argc, char **argv) {
     }
 
     char *inpath = maybe_uri_to_path(argv[1]);
-    if (!inpath) return 2;
+    if (!inpath) {
+        fprintf(stderr, "thumbnailer: unable to resolve input path: %s\n", argv[1]);
+        return 2;
+    }
     const char *outpath = argv[2];
     int size = atoi(argv[3]);
     if (size <= 0) size = 128;
+
+    fprintf(stderr, "thumbnailer: in=%s out=%s size=%d cwd=%s\n", inpath, outpath, size, g_get_current_dir());
 
     struct archive *a = archive_read_new();
     archive_read_support_format_all(a);
     archive_read_support_filter_all(a);
 
     if (archive_read_open_filename(a, inpath, 10240) != ARCHIVE_OK) {
+        fprintf(stderr, "thumbnailer: failed to open archive: %s\n", inpath);
         g_free(inpath);
         archive_read_free(a);
         return 1;
@@ -108,6 +114,11 @@ int main(int argc, char **argv) {
         GError *gerr = NULL;
         GdkPixbuf *pix = gdk_pixbuf_new_from_file(tmpfile, &gerr);
         if (!pix) {
+            if (gerr) {
+                fprintf(stderr, "thumbnailer: gdk-pixbuf failed to load '%s': %s\n", tmpfile, gerr->message);
+            } else {
+                fprintf(stderr, "thumbnailer: gdk-pixbuf failed to load '%s' (unknown error)\n", tmpfile);
+            }
             g_clear_error(&gerr);
             /* cleanup and try next image */
             unlink(tmpfile);
@@ -129,6 +140,7 @@ int main(int argc, char **argv) {
         g_object_unref(pix);
 
         if (!gdk_pixbuf_save(scaled, outpath, "png", &gerr, NULL)) {
+            fprintf(stderr, "thumbnailer: failed to save thumbnail '%s': %s\n", outpath, gerr ? gerr->message : "unknown");
             g_clear_error(&gerr);
             g_object_unref(scaled);
             unlink(tmpfile);
@@ -145,6 +157,7 @@ int main(int argc, char **argv) {
         g_object_unref(scaled);
 
         found = TRUE;
+        fprintf(stderr, "thumbnailer: wrote thumbnail '%s'\n", outpath);
         unlink(tmpfile);
         g_free(tmpfile);
         rmdir(tmpdir);
