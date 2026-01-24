@@ -82,7 +82,7 @@ if libarchive_dep.found()
   )
 
   test_cbz = files('test.cbz')
-  test('thumbnailer', th_exe, args : [test_cbz, 'build/test-thumb.png', '64'])
+  test('thumbnailer', th_exe, args : [test_cbz, 'test-thumb.png', '64'])
 endif
 
 install_data('data/org.jeremy.BrightEyes.desktop', install_dir : 'share/applications')
