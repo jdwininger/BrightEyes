@@ -1,0 +1,5 @@
+[Thumbnailer Entry]
+TryExec=brighteyes-thumbnailer
+Exec=brighteyes-thumbnailer %i %o %s
+MimeType=application/x-cbz;application/x-cbr;application/zip;application/x-rar;
+IsRemote=false

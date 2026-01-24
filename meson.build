@@ -75,7 +75,18 @@ executable('archive-convert-verify', ['tools/convert_verify.c', 'src/archive.c']
   install : false
 )
 
+if libarchive_dep.found()
+  th_exe = executable('brighteyes-thumbnailer', 'tools/thumbnailer.c',
+    dependencies : [libarchive_dep, gdkpixbuf_dep, glib_dep],
+    install : true
+  )
+
+  test('thumbnailer', th_exe, args : ['test.cbz', 'build/test-thumb.png', '64'])
+endif
+
 install_data('data/org.jeremy.BrightEyes.desktop', install_dir : 'share/applications')
+install_data('data/org.jeremy.BrightEyes.xml', install_dir : 'share/mime/packages')
+install_data('data/org.jeremy.BrightEyes.thumbnailer', install_dir : 'share/thumbnailers')
 install_data('icon-1024.png', install_dir : 'share/icons/hicolor/1024x1024/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('icon-1024.png', install_dir : 'share/icons/hicolor/512x512/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('LICENSE', install_dir : 'share/licenses/brighteyes')

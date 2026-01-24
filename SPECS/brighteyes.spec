@@ -20,6 +20,7 @@ BuildRequires:  gtk4-devel
 BuildRequires:  libadwaita-devel
 BuildRequires:  gdk-pixbuf2-devel
 BuildRequires:  glib2-devel
+BuildRequires:  libarchive-devel
 
 # Optional features
 %bcond_without gstreamer
@@ -46,6 +47,7 @@ Requires:       libadwaita
 Requires:       gdk-pixbuf2
 Requires:       glib2
 Requires:       adwaita-icon-theme
+Requires:       libarchive
 # If you enable media/ocr features at build time, the following may be needed at runtime
 # Requires:     gstreamer1
 # Requires:     tesseract
@@ -75,9 +77,10 @@ rm -rf %{buildroot}
 meson install -C build --destdir=%{buildroot}
 
 %post
-# Refresh icon cache and desktop database so the icon and .desktop entry are immediately available
+# Refresh icon cache, desktop database and mime database so the icon, .desktop, and mime entries are immediately available
 /sbin/gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor >/dev/null 2>&1 || true
 /usr/bin/update-desktop-database -q %{_datadir}/applications >/dev/null 2>&1 || true
+/usr/bin/update-mime-database -q %{_datadir}/mime >/dev/null 2>&1 || true
 
 %postun
 # On final removal (argument $1 == 0), refresh caches again
@@ -90,7 +93,10 @@ fi
 %license LICENSE
 %doc README.md
 /usr/bin/brighteyes
+/usr/bin/brighteyes-thumbnailer
+/usr/share/mime/packages/org.jeremy.BrightEyes.xml
 /usr/share/applications/org.jeremy.BrightEyes.desktop
+/usr/share/thumbnailers/org.jeremy.BrightEyes.thumbnailer
 /usr/share/icons/hicolor/1024x1024/apps/org.jeremy.BrightEyes.png
 /usr/share/icons/hicolor/512x512/apps/org.jeremy.BrightEyes.png
 

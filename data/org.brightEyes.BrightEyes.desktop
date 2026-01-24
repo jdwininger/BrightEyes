@@ -6,5 +6,5 @@ Icon=org.jeremy.BrightEyes
 StartupWMClass=brighteyes
 Type=Application
 Categories=Graphics;GNOME;ImageViewer;
-MimeType=image/*;video/*;
+MimeType=application/x-cbz;application/x-cbr;application/zip;application/x-rar;image/*;video/*;
 Terminal=false
