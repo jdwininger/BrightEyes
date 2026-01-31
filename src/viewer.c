@@ -14,6 +14,7 @@
 #include <math.h>
 #include <adwaita.h>
 #include "archive.h"
+#include "thumbnails.h"
 
 /* Animation pipeline removed to simplify the code; zooming will be reimplemented later. */
 
@@ -76,6 +77,7 @@ struct _Viewer {
     /* Video Controls */
     GtkWidget *video_controls_overlay; /* The box containing controls */
     GtkWidget *play_pause_btn;
+    GtkWidget *save_frame_btn;
     /* GIF playback controls */
     GtkWidget *gif_play_forward_btn;
     GtkWidget *gif_play_backward_btn;
@@ -164,6 +166,9 @@ static gboolean run_load_race_test_cb(gpointer user_data);
 static void handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf);
 static gboolean animation_tick(gpointer user_data);
 
+/* Utility: flatten an alpha-bearing GdkPixbuf onto an RGB background. */
+static GdkPixbuf *flatten_alpha_to_rgb(GdkPixbuf *src, guint8 bg_r, guint8 bg_g, guint8 bg_b);
+
 /* Forward declaration for animation helper (defined below) so it can be
  * referenced from earlier functions such as viewer_stop_playback(). */
 static void stop_animation(Viewer *self);
@@ -201,6 +206,96 @@ static void on_gif_play_backward_clicked(GtkButton *btn, Viewer *self);
 static void on_gif_step_forward_clicked(GtkButton *btn, Viewer *self);
 static void on_gif_step_backward_clicked(GtkButton *btn, Viewer *self);
 static void on_gif_stop_clicked(GtkButton *btn, Viewer *self);
+
+/* Save-frame handlers (forward-declared so viewer_init may connect the button)
+ * on_save_video_frame_response: completes the GtkFileDialog save request,
+ * captures the paused video frame and writes it to disk. This is a viewer-local
+ * implementation (does not depend on window-local static helpers) so the
+ * viewer can be used standalone in tests. */
+static void on_save_frame_clicked(GtkButton *button, gpointer user_data);
+static void on_save_video_frame_response(GObject *source_object, GAsyncResult *res, gpointer user_data);
+
+/* Completion handler for the Save-frame file dialog. It mirrors the
+ * important parts of the window-level save flow but writes the captured
+ * paused-frame using the viewer helper API. Uses GSettings **safely** (no
+ * abort if schema missing) and falls back to sensible defaults. */
+static void
+on_save_video_frame_response(GObject *source_object, GAsyncResult *res, gpointer user_data)
+{
+    Viewer *self = VIEWER(user_data);
+    if (!self) return;
+
+    GError *error = NULL;
+    GFile *file = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source_object), res, &error);
+    if (!file) {
+        if (error) g_clear_error(&error);
+        return;
+    }
+
+    char *path = g_file_get_path(file);
+    g_object_unref(file);
+    if (!path) return;
+
+    /* Determine requested format from extension */
+    const char *ext = strrchr(path, '.');
+    const char *fmt = "png";
+    if (ext) {
+        if (g_ascii_strcasecmp(ext, ".jpg") == 0 || g_ascii_strcasecmp(ext, ".jpeg") == 0)
+            fmt = "jpeg";
+        else if (g_ascii_strcasecmp(ext, ".png") == 0)
+            fmt = "png";
+    }
+
+    /* Default JPEG options */
+    int quality = 85;
+    guint8 br = 255, bg = 255, bb = 255;
+
+    /* Try to load persisted defaults from GSettings but do not abort if schema
+     * is missing (mirror get_settings_safe()). */
+    GSettings *settings = NULL;
+    GSettingsSchemaSource *src = g_settings_schema_source_get_default();
+    if (src && g_settings_schema_source_lookup(src, "org.jeremy.BrightEyes", TRUE)) {
+        settings = g_settings_new("org.jeremy.BrightEyes");
+    }
+
+    if (settings && g_strcmp0(fmt, "jpeg") == 0) {
+        quality = (int)g_settings_get_int(settings, "jpeg-quality");
+        char *hex = g_settings_get_string(settings, "jpeg-bg-color");
+        if (hex) {
+            guint8 rtmp, gtmp, btmp;
+            if (sscanf(hex, "#%2hhx%2hhx%2hhx", &rtmp, &gtmp, &btmp) == 3) {
+                br = rtmp; bg = gtmp; bb = btmp;
+            }
+            g_free(hex);
+        }
+        g_object_unref(settings);
+    }
+
+    GError *save_err = NULL;
+    if (!viewer_save_current_video_frame(self, path, fmt, quality, br, bg, bb, &save_err)) {
+        g_autofree char *msg = g_strdup_printf("Failed to save frame: %s", save_err ? save_err->message : "unknown");
+        /* Try to show overlay toast if possible (viewer is typically inside a window) */
+        GtkWindow *root = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(self)));
+        if (root) {
+            gpointer overlay = g_object_get_data(G_OBJECT(root), "toast-overlay");
+            if (ADW_IS_TOAST_OVERLAY(overlay))
+                adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(overlay), adw_toast_new(msg));
+        }
+        g_clear_error(&save_err);
+        g_free(path);
+        return;
+    }
+
+    /* Success: user feedback via toast when possible */
+    GtkWindow *root = GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(self)));
+    if (root) {
+        gpointer overlay = g_object_get_data(G_OBJECT(root), "toast-overlay");
+        if (ADW_IS_TOAST_OVERLAY(overlay))
+            adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(overlay), adw_toast_new("Frame saved"));
+    }
+
+    g_free(path);
+}
 
 /* Deferred pointer-anchored scroll helper removed: unused while scroll-wheel zoom is disabled. */
 
@@ -264,11 +359,24 @@ on_play_pause_clicked(GtkButton *btn, Viewer *self)
         gst_element_set_state(self->playbin, GST_STATE_PAUSED);
         gtk_button_set_icon_name(btn, "media-playback-start-symbolic");
         g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, FALSE);
+        if (self->save_frame_btn) gtk_widget_set_sensitive(self->save_frame_btn, TRUE);
     } else {
         gst_element_set_state(self->playbin, GST_STATE_PLAYING);
         gtk_button_set_icon_name(btn, "media-playback-pause-symbolic");
         g_signal_emit(self, signals[SIGNAL_PLAYBACK_CHANGED], 0, TRUE);
+        if (self->save_frame_btn) gtk_widget_set_sensitive(self->save_frame_btn, FALSE);
     }
+}
+
+/* Ensure emitting "playback-changed" externally produces the same UI update
+ * as the internal play/pause code path: keep the Save-frame button sensitivity
+ * in sync with the playing state. */
+static void
+on_internal_playback_changed(Viewer *self, gboolean playing, gpointer user_data)
+{
+    (void)user_data;
+    if (self->save_frame_btn)
+        gtk_widget_set_sensitive(self->save_frame_btn, !playing);
 }
 
 static void on_gif_play_forward_clicked(GtkButton *btn, Viewer *self)
@@ -643,6 +751,14 @@ viewer_init(Viewer *self)
     gtk_widget_set_tooltip_text(self->play_pause_btn, "Play / Pause (video or GIF)");
     gtk_box_append(GTK_BOX(controls_box), self->play_pause_btn);
 
+    /* Save-frame Button (captures current paused video frame) */
+    self->save_frame_btn = gtk_button_new_from_icon_name("camera-photo-symbolic");
+    gtk_widget_add_css_class(self->save_frame_btn, "flat");
+    gtk_widget_set_tooltip_text(self->save_frame_btn, "Save current video frame");
+    gtk_widget_set_sensitive(self->save_frame_btn, FALSE);
+    g_signal_connect(self->save_frame_btn, "clicked", G_CALLBACK(on_save_frame_clicked), self);
+    gtk_box_append(GTK_BOX(controls_box), self->save_frame_btn);
+
     /* Seek Scale */
     self->seek_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
     gtk_widget_set_size_request(self->seek_scale, 150, -1);
@@ -665,6 +781,17 @@ viewer_init(Viewer *self)
     gtk_box_append(GTK_BOX(controls_box), self->volume_scale);
 
     gtk_overlay_add_overlay(self->overlay, self->video_controls_overlay);
+
+    /* Apply CSS class names (global CSS ensures sensible min-size during
+     * initial toolkit measurement). Avoid explicit size requests so theme
+     * engines remain authoritative. */
+    gtk_widget_add_css_class(self->video_controls_overlay, "video-overlay");
+    gtk_widget_add_css_class(GTK_WIDGET(self->image_stack), "viewer-scroller");
+    gtk_widget_add_css_class(GTK_WIDGET(self->scrolled_window), "viewer-scroller");
+
+    /* Keep Save-frame sensitivity in sync if external code (or tests)
+     * emit the "playback-changed" signal on this instance. */
+    g_signal_connect(self, "playback-changed", G_CALLBACK(on_internal_playback_changed), NULL);
 
     gtk_widget_set_hexpand(GTK_WIDGET(self), TRUE);
     gtk_widget_set_vexpand(GTK_WIDGET(self), TRUE);
@@ -712,6 +839,147 @@ on_gst_error (GstBus *bus, GstMessage *msg, Viewer *self)
     
     g_clear_error (&err);
     g_free (debug_info);
+}
+
+/* Handler for the Save-frame button: open the Save dialog and use a
+ * dedicated completion handler that captures the paused frame and writes
+ * it to the chosen path. */
+static void
+on_save_frame_clicked(GtkButton *button, gpointer user_data)
+{
+    Viewer *self = VIEWER(user_data);
+    if (!self || !self->playbin) return;
+
+    /* Only allow when video is paused or stopped */
+    GstState state;
+    gst_element_get_state(self->playbin, &state, NULL, 0);
+    if (state == GST_STATE_PLAYING) {
+        /* prefer user to pause first for accuracy */
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->overlay), adw_toast_new("Pause the video before saving a frame"));
+        return;
+    }
+
+    char *suggest = g_strdup("frame.png");
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dlg, "Save frame as");
+    gtk_file_dialog_set_accept_label(dlg, "Save");
+
+    GFile *initial = g_file_new_for_path(suggest);
+    gtk_file_dialog_set_initial_file(dlg, initial);
+    g_object_unref(initial);
+    g_free(suggest);
+
+    /* Completion handler will capture & save the frame */
+    gtk_file_dialog_save(dlg, GTK_WINDOW(gtk_widget_get_root(GTK_WIDGET(button))), NULL, on_save_video_frame_response, g_object_ref(self));
+}
+
+/* Implementations that require access to Viewer internals (must live in
+ * this translation unit). These reuse the thumbnail capture pipeline and
+ * mirror the image-save behavior (alpha flattening, quality). */
+
+bool
+viewer_capture_current_video_frame(Viewer *self, int width, GdkPixbuf **out_pixbuf, GError **error)
+{
+    g_return_val_if_fail(out_pixbuf != NULL, FALSE);
+    *out_pixbuf = NULL;
+
+    if (!self || !self->playbin) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "invalid viewer or not a video");
+        return FALSE;
+    }
+
+    /* Determine a source filename/URI for the current playbin. The
+     * viewer does not keep a separate `path` field; query the playbin's
+     * "uri" property and convert to a local filename if necessary. */
+    gchar *uri = NULL;
+    g_object_get(self->playbin, "uri", &uri, NULL);
+    if (!uri || uri[0] == '\0') {
+        if (uri) g_free(uri);
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "no media URI available on playbin");
+        return FALSE;
+    }
+
+    gchar *path = NULL;
+    GError *uerr = NULL;
+    if (g_str_has_prefix(uri, "file://")) {
+        path = g_filename_from_uri(uri, NULL, &uerr);
+        if (!path) {
+            g_propagate_error(error, uerr);
+            g_free(uri);
+            return FALSE;
+        }
+    } else {
+        /* Non-file URIs (http, etc.) — pass the URI as-is to the capture
+         * helper which will accept a URI if the pipeline supports it. The
+         * thumbnail helper expects a filesystem path, so for non-file URIs
+         * we fall back to a separate pipeline approach: create a temporary
+         * pipeline and grab the last-pixbuf (reuse thumbnails_capture_video_frame
+         * by passing the original path only for file: URIs). */
+        g_free(uri);
+        int req_w = width;
+        if (req_w <= 0) {
+            int aw = gtk_widget_get_width(self->active_picture);
+            req_w = aw > 0 ? aw : 640;
+        }
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "non-file URIs are not supported by this capture path");
+        return FALSE;
+    }
+
+    int req_w = width;
+    if (req_w <= 0) {
+        int aw = gtk_widget_get_width(self->active_picture);
+        req_w = aw > 0 ? aw : 640;
+    }
+
+    gboolean ret = thumbnails_capture_video_frame(path, req_w, out_pixbuf, error);
+    g_free(path);
+    g_free(uri);
+    return ret;
+}
+
+bool
+viewer_save_current_video_frame(Viewer *self, const char *dest_path, const char *format, int quality, guint8 bg_r, guint8 bg_g, guint8 bg_b, GError **error)
+{
+    if (!self || !dest_path) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "invalid arguments");
+        return FALSE;
+    }
+
+    GError *err = NULL;
+    GdkPixbuf *pix = NULL;
+    if (!viewer_capture_current_video_frame(self, 0, &pix, &err)) {
+        g_propagate_error(error, err);
+        return FALSE;
+    }
+
+    gboolean ok = FALSE;
+    GdkPixbuf *to_save = pix;
+    if (gdk_pixbuf_get_has_alpha(pix) && format && g_strcmp0(format, "jpeg") == 0) {
+        to_save = flatten_alpha_to_rgb(pix, bg_r, bg_g, bg_b);
+        if (!to_save) {
+            g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "failed to flatten alpha");
+            g_object_unref(pix);
+            return FALSE;
+        }
+    } else {
+        to_save = g_object_ref(pix);
+    }
+
+    if (format && g_strcmp0(format, "jpeg") == 0) {
+        char qbuf[4];
+        int q = quality;
+        if (q <= 0 || q > 100) q = 85;
+        g_snprintf(qbuf, sizeof(qbuf), "%d", q);
+        ok = gdk_pixbuf_save(to_save, dest_path, "jpeg", &err, "quality", qbuf, NULL);
+    } else {
+        ok = gdk_pixbuf_save(to_save, dest_path, "png", &err, NULL);
+    }
+
+    g_object_unref(to_save);
+    g_object_unref(pix);
+
+    if (!ok) g_propagate_error(error, err);
+    return ok;
 }
 
 static void
@@ -835,26 +1103,10 @@ void viewer_play_forward(Viewer *self)
         return;
     }
 
-    /* Iterator-driven fallback */
-    if (self->anim_iter) {
-        if (self->anim_timeout_id > 0) {
-            g_source_remove(self->anim_timeout_id);
-            self->anim_timeout_id = 0;
-        }
-        /* Rewind iterator so replay always starts clean and timing is refreshed. */
-        g_clear_object(&self->anim_iter);
-        if (self->animation)
-            self->anim_iter = gdk_pixbuf_animation_get_iter(self->animation, NULL);
-
-        if (self->anim_iter) {
-            GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
-            if (frame) handle_loaded_pixbuf(self, g_object_ref(frame));
-
-            int delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
-            if (delay <= 0) delay = 100;
-            self->anim_timeout_id = g_timeout_add((guint)delay, animation_tick, self);
-        }
-    }
+    /* If no cached frames are available, do nothing — loader will have
+       attempted to build a cache during load. Rely on the static image in
+       `original_pixbuf` as a fallback. */
+    (void)self;
 }
 
 void viewer_play_backward(Viewer *self)
@@ -889,6 +1141,13 @@ void viewer_step_forward(Viewer *self)
     }
 
     /* Iterator-driven fallback: advance iterator once */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     if (self->anim_iter) {
         if (self->anim_timeout_id > 0) {
             g_source_remove(self->anim_timeout_id);
@@ -902,6 +1161,11 @@ void viewer_step_forward(Viewer *self)
             if (frame) handle_loaded_pixbuf(self, g_object_ref(frame));
         }
     }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 }
 
 void viewer_step_backward(Viewer *self)
@@ -1138,22 +1402,30 @@ static void stop_animation(Viewer *self)
 
 static gboolean animation_tick(gpointer user_data)
 {
+    /* Unified tick that drives cache-based playback. The legacy iterator-driven
+     * path was removed from the runtime; loader code still enumerates frames
+     * once at load time and populates `anim_frames`/`anim_frame_delays`.
+     */
     Viewer *self = VIEWER(user_data);
-    if (!self || !self->anim_iter) return G_SOURCE_REMOVE;
-    /* Advance iterator using real time to avoid freezing after manual controls. */
-    GTimeVal tv;
-    g_get_current_time(&tv);
-    gboolean advanced = gdk_pixbuf_animation_iter_advance(self->anim_iter, &tv);
-    if (advanced) {
-        GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
-        if (frame) {
-            handle_loaded_pixbuf(self, g_object_ref(frame));
-        }
+    if (!self || !self->anim_frames || self->anim_frames->len == 0) return G_SOURCE_REMOVE;
+
+    int n = (int)self->anim_frames->len;
+    if (self->anim_play_forward) {
+        self->anim_current_frame = (self->anim_current_frame + 1) % n;
+    } else {
+        self->anim_current_frame = (self->anim_current_frame - 1 + n) % n;
     }
 
-    int delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
-    if (delay <= 0) delay = 100;
-    self->anim_timeout_id = g_timeout_add((guint)delay, animation_tick, self);
+    GdkPixbuf *frame = g_ptr_array_index(self->anim_frames, self->anim_current_frame);
+    if (frame) {
+        handle_loaded_pixbuf(self, g_object_ref(frame));
+    }
+
+    guint delay = 100;
+    if (self->anim_frame_delays && self->anim_frame_delays->len > 0)
+        delay = g_array_index(self->anim_frame_delays, guint, self->anim_current_frame);
+
+    self->anim_timeout_id = g_timeout_add(delay, animation_tick, self);
     return G_SOURCE_REMOVE;
 }
 
@@ -1206,42 +1478,49 @@ static void
 log_gif_control_allocs(Viewer *self)
 {
     if (!self) return;
-    int w, h;
-    const char *name = "(null)";
 
-    if (self->video_controls_overlay) {
-        w = gtk_widget_get_width(self->video_controls_overlay);
-        h = gtk_widget_get_height(self->video_controls_overlay);
+    /* Only inspect allocations when widgets are realized and have a
+     * non-zero allocation. This avoids spurious GTK warnings under
+     * headless backends (Xvfb) where allocation can be deferred. */
+    if (self->video_controls_overlay && gtk_widget_get_realized(self->video_controls_overlay) && gtk_widget_get_width(self->video_controls_overlay) > 0) {
+        int w = gtk_widget_get_width(self->video_controls_overlay);
+        int h = gtk_widget_get_height(self->video_controls_overlay);
         g_info("GIF alloc: video_controls_overlay size=%dx%d visible=%d", w, h, (int)gtk_widget_get_visible(self->video_controls_overlay));
+    } else if (self->video_controls_overlay) {
+        g_info("GIF alloc: video_controls_overlay not realized yet (visible=%d)", (int)gtk_widget_get_visible(self->video_controls_overlay));
     }
 
-    if (self->gif_play_forward_btn) {
-        w = gtk_widget_get_width(self->gif_play_forward_btn);
-        h = gtk_widget_get_height(self->gif_play_forward_btn);
+    if (self->gif_play_forward_btn && gtk_widget_get_realized(self->gif_play_forward_btn) && gtk_widget_get_width(self->gif_play_forward_btn) > 0) {
+        int w = gtk_widget_get_width(self->gif_play_forward_btn);
+        int h = gtk_widget_get_height(self->gif_play_forward_btn);
         g_info("GIF alloc: play_forward size=%dx%d visible=%d sensitive=%d", w, h,
                (int)gtk_widget_get_visible(self->gif_play_forward_btn), (int)gtk_widget_get_sensitive(self->gif_play_forward_btn));
     }
-    if (self->gif_play_backward_btn) {
-        w = gtk_widget_get_width(self->gif_play_backward_btn);
-        h = gtk_widget_get_height(self->gif_play_backward_btn);
+
+    if (self->gif_play_backward_btn && gtk_widget_get_realized(self->gif_play_backward_btn) && gtk_widget_get_width(self->gif_play_backward_btn) > 0) {
+        int w = gtk_widget_get_width(self->gif_play_backward_btn);
+        int h = gtk_widget_get_height(self->gif_play_backward_btn);
         g_info("GIF alloc: play_backward size=%dx%d visible=%d sensitive=%d", w, h,
                (int)gtk_widget_get_visible(self->gif_play_backward_btn), (int)gtk_widget_get_sensitive(self->gif_play_backward_btn));
     }
-    if (self->gif_step_forward_btn) {
-        w = gtk_widget_get_width(self->gif_step_forward_btn);
-        h = gtk_widget_get_height(self->gif_step_forward_btn);
+
+    if (self->gif_step_forward_btn && gtk_widget_get_realized(self->gif_step_forward_btn) && gtk_widget_get_width(self->gif_step_forward_btn) > 0) {
+        int w = gtk_widget_get_width(self->gif_step_forward_btn);
+        int h = gtk_widget_get_height(self->gif_step_forward_btn);
         g_info("GIF alloc: step_forward size=%dx%d visible=%d sensitive=%d", w, h,
                (int)gtk_widget_get_visible(self->gif_step_forward_btn), (int)gtk_widget_get_sensitive(self->gif_step_forward_btn));
     }
-    if (self->gif_step_backward_btn) {
-        w = gtk_widget_get_width(self->gif_step_backward_btn);
-        h = gtk_widget_get_height(self->gif_step_backward_btn);
+
+    if (self->gif_step_backward_btn && gtk_widget_get_realized(self->gif_step_backward_btn) && gtk_widget_get_width(self->gif_step_backward_btn) > 0) {
+        int w = gtk_widget_get_width(self->gif_step_backward_btn);
+        int h = gtk_widget_get_height(self->gif_step_backward_btn);
         g_info("GIF alloc: step_backward size=%dx%d visible=%d sensitive=%d", w, h,
                (int)gtk_widget_get_visible(self->gif_step_backward_btn), (int)gtk_widget_get_sensitive(self->gif_step_backward_btn));
     }
-    if (self->gif_stop_btn) {
-        w = gtk_widget_get_width(self->gif_stop_btn);
-        h = gtk_widget_get_height(self->gif_stop_btn);
+
+    if (self->gif_stop_btn && gtk_widget_get_realized(self->gif_stop_btn) && gtk_widget_get_width(self->gif_stop_btn) > 0) {
+        int w = gtk_widget_get_width(self->gif_stop_btn);
+        int h = gtk_widget_get_height(self->gif_stop_btn);
         g_info("GIF alloc: stop size=%dx%d visible=%d sensitive=%d", w, h,
                (int)gtk_widget_get_visible(self->gif_stop_btn), (int)gtk_widget_get_sensitive(self->gif_stop_btn));
     }
@@ -1308,7 +1587,19 @@ on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
     LoadCtx *ctx = (LoadCtx *)user_data;
     Viewer *self = VIEWER(ctx->self);
     GError *err = NULL;
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     GdkPixbufAnimation *anim = gdk_pixbuf_animation_new_from_stream_finish(res, &err);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
     if (ctx->load_seq != self->load_seq) {
         if (anim) g_object_unref(anim);
@@ -1330,6 +1621,20 @@ on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
     self->animation = g_object_ref(anim);
     g_info("on_animation_loaded: animation object loaded");
     /* Create iter and display first frame */
+
+    /*
+     * The gdk-pixbuf animation iterator API is deprecated; retain the
+     * existing loader-time cache logic for now but suppress deprecation
+     * warnings here. A future refactor should replace this with a
+     * GdkPixbufLoader-based frame extractor (see TODO).
+     */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     self->anim_iter = gdk_pixbuf_animation_get_iter(self->animation, NULL);
     if (self->anim_iter) {
         /* Try to build a lightweight frame cache for accurate stepping and
@@ -1343,9 +1648,21 @@ on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
         /* Deep-copy frames so we can step/reverse even when the iterator reuses
          * the same underlying pixbuf pointer. Detect loop by comparing to the
          * first frame's pixel data. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
         GdkPixbuf *first = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
         guint first_delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
         if (first_delay <= 0) first_delay = 100;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
         if (first) {
             GdkPixbuf *first_copy = gdk_pixbuf_copy(first);
@@ -1367,12 +1684,24 @@ on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
 
             if (!gdk_pixbuf_animation_iter_advance(self->anim_iter, &tv)) break;
 
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
             GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
             if (!frame) break;
 
             guint delay = gdk_pixbuf_animation_iter_get_delay_time(self->anim_iter);
             if (delay <= 0) delay = 100;
             prev_delay = delay;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
             /* Detect loop only after we've observed at least one unique frame.
              * Some GIFs repeat the first frame before advancing; if we break
@@ -1424,6 +1753,11 @@ on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
                 if (!same_as_first) saw_unique_frame = TRUE;
             }
         }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
         /* Display first cached frame */
         guint nframes = (guint)self->anim_frames->len;
@@ -1484,10 +1818,22 @@ on_animation_loaded(GObject *source, GAsyncResult *res, gpointer user_data)
              * cache wasn't available. Some actions (reverse/step-back)
              * may not be meaningful with iterator-driven playback; leave
              * them disabled in that case. */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
             GdkPixbuf *frame = gdk_pixbuf_animation_iter_get_pixbuf(self->anim_iter);
             if (frame) {
                 handle_loaded_pixbuf(self, g_object_ref(frame));
             }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
             /* Enable primary controls: play/stop and play-forward. Leave
              * backward/step-back disabled unless we have a multi-frame cache. */
@@ -1713,6 +2059,11 @@ viewer_load_file(Viewer *self, const char *path)
             if (self->video_update_id == 0)
                 self->video_update_id = g_timeout_add(200, on_video_update, self);
 
+            /* Ensure Save-frame button sensitivity matches paused/playing state */
+            GstState __state_tmp;
+            gst_element_get_state(self->playbin, &__state_tmp, NULL, 0);
+            if (self->save_frame_btn) gtk_widget_set_sensitive(self->save_frame_btn, __state_tmp != GST_STATE_PLAYING);
+
             /* Start Transition for Video */
             const char *view_name = (self->active_picture == self->picture_1) ? "view1" : "view2";
             gtk_stack_set_visible_child_name(GTK_STACK(self->image_stack), view_name);
@@ -1738,7 +2089,19 @@ viewer_load_file(Viewer *self, const char *path)
             GFileInputStream *stream = g_file_read(file, NULL, NULL);
             if (stream) {
                 /* Create memory stream wrapper by reading into memory asynchronously is complex; instead use animation loader from stream synchronously via g_input_stream */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
                 gdk_pixbuf_animation_new_from_stream_async(G_INPUT_STREAM(stream), self->load_cancellable, on_animation_loaded, ctx);
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
                 g_object_unref(stream);
                 g_object_unref(file);
                 return;
@@ -2285,6 +2648,156 @@ viewer_clear_selection(Viewer *self)
     gtk_widget_queue_draw(self->selection_overlay);
 }
 
+
+/* Save helper: flatten alpha into an RGB pixbuf (background r/g/b 0..255).
+ * Returns a new reference which the caller must unref. If `src` has no alpha
+ * the function returns a ref to `src`. */
+static GdkPixbuf *
+flatten_alpha_to_rgb(GdkPixbuf *src, guint8 bg_r, guint8 bg_g, guint8 bg_b)
+{
+    if (!gdk_pixbuf_get_has_alpha(src))
+        return g_object_ref(src);
+
+    int w = gdk_pixbuf_get_width(src);
+    int h = gdk_pixbuf_get_height(src);
+    int src_row = gdk_pixbuf_get_rowstride(src);
+    int dst_row;
+
+    GdkPixbuf *dst = gdk_pixbuf_new(GDK_COLORSPACE_RGB, FALSE, 8, w, h);
+    if (!dst) return NULL;
+
+    dst_row = gdk_pixbuf_get_rowstride(dst);
+    guchar *sp = gdk_pixbuf_get_pixels(src);
+    guchar *dp = gdk_pixbuf_get_pixels(dst);
+    int src_n = gdk_pixbuf_get_n_channels(src); /* usually 4 when has-alpha */
+
+    /* Defensive: ensure channel layout is sane. If we unexpectedly see a
+     * pixbuf with 'has_alpha' but fewer than 4 channels, avoid out-of-bounds
+     * reads and fail gracefully (caller will handle error). */
+    if (gdk_pixbuf_get_has_alpha(src) && src_n < 2) {
+        g_warning("flatten_alpha_to_rgb: unexpected channel count (%d) for pixbuf with alpha", src_n);
+        g_object_unref(dst);
+        return NULL;
+    }
+
+    for (int y = 0; y < h; y++) {
+        guchar *s = sp + y * src_row;
+        guchar *d = dp + y * dst_row;
+        for (int x = 0; x < w; x++) {
+            guint8 sr = 0, sg = 0, sb = 0, sa = 255;
+
+            /* Populate source channels safely based on reported channel count.
+             * Common cases:
+             *  - src_n == 4 : RGBA
+             *  - src_n == 3 : RGB (should not have alpha)
+             *  - src_n == 2 : Gray + Alpha (some loaders produce this)
+             */
+            if (src_n >= 4) {
+                sr = s[0]; sg = s[1]; sb = s[2]; sa = s[3];
+            } else if (src_n == 3) {
+                /* No alpha channel — treat as opaque RGB */
+                sr = s[0]; sg = s[1]; sb = s[2]; sa = 255;
+            } else if (src_n == 2) {
+                /* Grayscale + alpha: replicate gray into RGB */
+                sr = sg = sb = s[0]; sa = s[1];
+            } else if (src_n == 1) {
+                /* Grayscale, no alpha */
+                sr = sg = sb = s[0]; sa = 255;
+            } else {
+                /* Unknown layout — guard against crash. */
+                g_warning("flatten_alpha_to_rgb: unsupported channel count=%d; treating as opaque", src_n);
+                sr = sg = sb = s[0]; sa = 255;
+            }
+
+            /* composite over constant background using integer arithmetic */
+            int inva = 255 - sa;
+            d[0] = (guchar)((sr * sa + bg_r * inva) / 255);
+            d[1] = (guchar)((sg * sa + bg_g * inva) / 255);
+            d[2] = (guchar)((sb * sa + bg_b * inva) / 255);
+
+            s += src_n;
+            d += 3;
+        }
+    }
+
+    return dst;
+}
+
+/* Public: save the currently displayed image to disk.
+ * - Supports "png" and "jpeg" ("jpg" accepted). JPEG will be flattened
+ *   against white if the source has an alpha channel.
+ * - Returns TRUE on success and sets `error` on failure. */
+gboolean
+viewer_save_image(Viewer *self, const char *dest_path, const char *format, int quality, guint8 bg_r, guint8 bg_g, guint8 bg_b, GError **error)
+{
+    if (!self || !dest_path) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "invalid arguments");
+        return FALSE;
+    }
+
+    GdkPixbuf *src = NULL;
+    /* Prefer current GIF frame for animations, otherwise the original pixbuf */
+    if (self->animation && self->anim_frames && self->anim_frames->len > 0) {
+        GdkPixbuf *frame = g_ptr_array_index(self->anim_frames, self->anim_current_frame);
+        if (frame) src = g_object_ref(frame);
+    } else if (self->original_pixbuf) {
+        src = g_object_ref(self->original_pixbuf);
+    }
+
+    if (!src) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "no image available to save");
+        return FALSE;
+    }
+
+    /* Diagnostic: log pixbuf layout so we can trace crashes reported by users */
+    int src_n = gdk_pixbuf_get_n_channels(src);
+    gboolean has_alpha = gdk_pixbuf_get_has_alpha(src);
+    g_debug("viewer_save_image: src dims=%dx%d channels=%d has_alpha=%d",
+            gdk_pixbuf_get_width(src), gdk_pixbuf_get_height(src), src_n, (int)has_alpha);
+    if (has_alpha && src_n < 3) {
+        g_warning("viewer_save_image: unexpected pixbuf channel count=%d with alpha; aborting save to avoid crash", src_n);
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "unsupported source pixel layout");
+        g_object_unref(src);
+        return FALSE;
+    }
+
+    const char *fmt = format ? format : "png";
+    if (g_strcmp0(fmt, "jpg") == 0) fmt = "jpeg";
+
+    if (g_strcmp0(fmt, "png") != 0 && g_strcmp0(fmt, "jpeg") != 0) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED, "unsupported output format: %s", format);
+        g_object_unref(src);
+        return FALSE;
+    }
+
+    GdkPixbuf *to_save = src;
+    if (gdk_pixbuf_get_has_alpha(src) && g_strcmp0(fmt, "jpeg") == 0) {
+        to_save = flatten_alpha_to_rgb(src, bg_r, bg_g, bg_b);
+        if (!to_save) {
+            g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "failed to flatten alpha");
+            g_object_unref(src);
+            return FALSE;
+        }
+    } else {
+        /* keep a ref for symmetry with unref below */
+        to_save = g_object_ref(src);
+    }
+
+    gboolean ok = FALSE;
+    if (g_strcmp0(fmt, "jpeg") == 0) {
+        char qbuf[4];
+        int q = quality;
+        if (q <= 0 || q > 100) q = 85;
+        g_snprintf(qbuf, sizeof(qbuf), "%d", q);
+        ok = gdk_pixbuf_save(to_save, dest_path, "jpeg", error, "quality", qbuf, NULL);
+    } else {
+        ok = gdk_pixbuf_save(to_save, dest_path, "png", error, NULL);
+    }
+
+    g_object_unref(to_save);
+    g_object_unref(src);
+    return ok;
+}
 
 /* Helper: compute zoom scale that fits image width to viewport width */
 static double
