@@ -19,6 +19,7 @@ static gboolean is_image_filename(const char *name) {
     if (g_ascii_strcasecmp(ext, "png") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "gif") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "webp") == 0) return TRUE;
+    if (g_ascii_strcasecmp(ext, "avif") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "bmp") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "tif") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "tiff") == 0) return TRUE;

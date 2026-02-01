@@ -36,6 +36,10 @@ void viewer_step_forward(Viewer *self);
 void viewer_step_backward(Viewer *self);
 void viewer_stop_animation_playback(Viewer *self);
 
+/* Video frame capture/save helpers (capture current play position). */
+bool viewer_capture_current_video_frame(Viewer *self, int width, GdkPixbuf **out_pixbuf, GError **error);
+bool viewer_save_current_video_frame(Viewer *self, const char *dest_path, const char *format, int quality, guint8 bg_r, guint8 bg_g, guint8 bg_b, GError **error);
+
 guint viewer_get_zoom_level_percentage(Viewer *self);
 
 void viewer_set_fit_to_width(Viewer *self);
@@ -54,6 +58,11 @@ gboolean viewer_get_selection_mode(Viewer *self);
 /* Returns a newly allocated GdkPixbuf containing the selected region in image pixels, or NULL if no selection.
    Caller owns the returned pixbuf. */
 GdkPixbuf *viewer_get_selection_pixbuf(Viewer *self);
+
+/* Save the currently displayed image (current animation frame for GIFs) to `dest_path`.
+ * `format` must be "png" or "jpeg" ("jpg" is accepted). `quality` is used for JPEG (1-100).
+ * Returns TRUE on success and sets `error` on failure. */
+gboolean viewer_save_image(Viewer *self, const char *dest_path, const char *format, int quality, guint8 bg_r, guint8 bg_g, guint8 bg_b, GError **error);
 
 /* Clear any existing selection. */
 void viewer_clear_selection(Viewer *self);

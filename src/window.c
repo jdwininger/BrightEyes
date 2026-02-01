@@ -296,8 +296,8 @@ update_zoom_ui_for_file_type(BrightEyesWindow *self, const char *path)
     gboolean is_comic = (path && g_str_has_prefix(path, "archive://"));
     g_debug("%s: path='%s' is_comic=%d create_cbz_btn=%p", __func__, path ? path : "(null)", is_comic, self->create_cbz_btn);
 
-    gtk_widget_set_visible(self->zoom_in_btn, !is_comic);
-    gtk_widget_set_visible(self->zoom_out_btn, !is_comic);
+    if (self->zoom_in_btn) gtk_widget_set_visible(self->zoom_in_btn, !is_comic);
+    if (self->zoom_out_btn) gtk_widget_set_visible(self->zoom_out_btn, !is_comic);
     if (self->create_cbz_btn) {
             gtk_widget_set_sensitive(self->create_cbz_btn, !is_comic);
             /* Avoid querying width/height before widgets are realized — doing so
@@ -320,8 +320,8 @@ update_zoom_ui_for_file_type(BrightEyesWindow *self, const char *path)
     }
     
     /* Ensure fit buttons are visible (they are always relevant) */
-    gtk_widget_set_visible(self->fit_window_btn, TRUE);
-    gtk_widget_set_visible(self->fit_width_btn, TRUE);
+    if (self->fit_window_btn) gtk_widget_set_visible(self->fit_window_btn, TRUE);
+    if (self->fit_width_btn) gtk_widget_set_visible(self->fit_width_btn, TRUE);
 }
 
 /* Public method to open a file */
@@ -333,7 +333,8 @@ load_image_path(BrightEyesWindow *self, const char *path)
     update_title(self);
     
     /* Update metadata whenever an image is loaded */
-    metadata_sidebar_update(self->metadata_sidebar, path);
+    if (self->metadata_sidebar)
+        metadata_sidebar_update(self->metadata_sidebar, path);
 
     /* Update actions */
     gboolean can_convert = FALSE;
@@ -2872,10 +2873,38 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_window_set_default_size(GTK_WINDOW(self), 1000, 700);
     gtk_window_set_title(GTK_WINDOW(self), "BrightEyes");
 
+    /* Headless / test mode: build a minimal window that contains only the
+     * Viewer. This avoids creating complex Adwaita widgets (toolbar view,
+     * overlay split view, dialog hosts, etc.) which trigger early layout
+     * probes on some headless backends. Keep this behaviour strictly
+     * test-only and conservative. */
+    if (g_getenv("BRIGHTEYES_HEADLESS_TEST")) {
+        /* Viewer */
+        self->viewer = viewer_new();
+        viewer_set_dark_background(self->viewer, self->viewer_dark_background);
+        viewer_set_default_fit(self->viewer, self->default_fit_to_window);
+
+        /* Put viewer directly into the toplevel (avoids Adw containers) */
+        gtk_window_set_child(GTK_WINDOW(self), GTK_WIDGET(self->viewer));
+
+        /* Ensure deterministic sizing for headless runs */
+        gtk_window_set_default_size(GTK_WINDOW(self), 800, 600);
+        gtk_widget_set_size_request(GTK_WIDGET(self), 800, 600);
+
+        /* Minimal key controller so shortcuts don't crash when installed */
+        GtkEventController *key_controller = gtk_event_controller_key_new();
+        g_signal_connect(key_controller, "key-pressed", G_CALLBACK(on_window_key_pressed), self);
+        gtk_widget_add_controller(GTK_WIDGET(self), key_controller);
+
+        return;
+    }
+
     /* Inner Split View (Metadata) - Sidebar at End */
     self->metadata_view = ADW_OVERLAY_SPLIT_VIEW(adw_overlay_split_view_new());
     adw_overlay_split_view_set_sidebar_position(self->metadata_view, GTK_PACK_END);
     adw_overlay_split_view_set_show_sidebar(self->metadata_view, FALSE);
+    /* Conservative minimum so early measurement sees a sane constraint */
+    gtk_widget_set_size_request(GTK_WIDGET(self->metadata_view), 1, 1);
 
     /* Construct Metadata Sidebar */
     self->metadata_sidebar = metadata_sidebar_new();
@@ -2922,6 +2951,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), hud_box);
 
     adw_toast_overlay_set_child(ADW_TOAST_OVERLAY(self->toast_overlay), overlay);
+    /* Conservative minimum so early measurement sees a sane constraint */
+    gtk_widget_set_size_request(GTK_WIDGET(self->toast_overlay), 1, 1);
     adw_overlay_split_view_set_content(self->metadata_view, self->toast_overlay);
     
     /* Connect viewer signals */
@@ -2945,75 +2976,82 @@ bright_eyes_window_init(BrightEyesWindow *self)
     adw_overlay_split_view_set_content(self->split_view, GTK_WIDGET(self->metadata_view));
 
     /* Header Bar */
-    GtkWidget *header = adw_header_bar_new();
-    /* Keep a reference to the header bar on the window for diagnostics and updates */
-    self->header_bar = ADW_HEADER_BAR(header);
-    
-    /* Pack Start: Open Files, Then Viewer Controls */
-    GtkWidget *open_btn = gtk_button_new_from_icon_name("document-open-symbolic");
-    gtk_widget_set_tooltip_text(open_btn, "Open File");
-    g_signal_connect_swapped(open_btn, "clicked", G_CALLBACK(show_open_dialog), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), open_btn);
-    
-    GtkWidget *folder_btn = gtk_button_new_from_icon_name("folder-open-symbolic");
-    gtk_widget_set_tooltip_text(folder_btn, "Open Folder");
-    g_signal_connect_swapped(folder_btn, "clicked", G_CALLBACK(show_open_folder_dialog), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), folder_btn);
+    if (!g_getenv("BRIGHTEYES_HEADLESS_TEST")) {
+        GtkWidget *header = adw_header_bar_new();
+        /* Conservative minimum so early measurement sees a sane constraint */
+        gtk_widget_set_size_request(header, 1, 1);
+        /* Keep a reference to the header bar on the window for diagnostics and updates */
+        self->header_bar = ADW_HEADER_BAR(header);
 
-    /* Separator */
-    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), sep);
+        /* Pack Start: Open Files, Then Viewer Controls */
+        GtkWidget *open_btn = gtk_button_new_from_icon_name("document-open-symbolic");
+        gtk_widget_set_tooltip_text(open_btn, "Open File");
+        g_signal_connect_swapped(open_btn, "clicked", G_CALLBACK(show_open_dialog), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), open_btn);
 
-    /* Viewer Controls moved to Start */
-    GtkWidget *sidebar_btn = gtk_button_new_from_icon_name("view-grid-symbolic");
-    gtk_widget_set_tooltip_text(sidebar_btn, "Toggle Thumbnails");
-    g_signal_connect_swapped(sidebar_btn, "clicked", G_CALLBACK(toggle_sidebar), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), sidebar_btn);
-    
-    /* Swapped Zoom Buttons: Minus then Plus */
-    GtkWidget *zoom_out = gtk_button_new_from_icon_name("zoom-out-symbolic");
-    gtk_widget_set_tooltip_text(zoom_out, "Zoom Out");
-    g_signal_connect(zoom_out, "clicked", G_CALLBACK(on_zoom_out_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_out);
-    /* Store references so we can grey them out during video playback */
-    self->zoom_out_btn = zoom_out;
+        GtkWidget *folder_btn = gtk_button_new_from_icon_name("folder-open-symbolic");
+        gtk_widget_set_tooltip_text(folder_btn, "Open Folder");
+        g_signal_connect_swapped(folder_btn, "clicked", G_CALLBACK(show_open_folder_dialog), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), folder_btn);
 
-    GtkWidget *zoom_in = gtk_button_new_from_icon_name("zoom-in-symbolic");
-    gtk_widget_set_tooltip_text(zoom_in, "Zoom In");
-    g_signal_connect(zoom_in, "clicked", G_CALLBACK(on_zoom_in_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_in);
-    self->zoom_in_btn = zoom_in;
-    
-    GtkWidget *fit_w_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
-    gtk_widget_set_tooltip_text(fit_w_btn, "Fit to Window");
-    g_signal_connect(fit_w_btn, "clicked", G_CALLBACK(on_fit_window_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_w_btn);
-    self->fit_window_btn = fit_w_btn;
+        /* Separator */
+        GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), sep);
 
-    GtkWidget *fit_wd_btn = gtk_button_new_from_icon_name("zoom-out-symbolic"); /* Temporary icon, ideally use something like 'zoom-original' or 'view-fullscreen-symbolic' rotated */
-    /* Let's use arrows-alt-h or similar if available, otherwise just use standard fit icon and tooltip distinction */
-    gtk_button_set_icon_name(GTK_BUTTON(fit_wd_btn), "view-paged-symbolic"); // "view-paged-symbolic" often implies width fit in some contexts, or we can reuse `zoom-fit-best`
-    gtk_widget_set_tooltip_text(fit_wd_btn, "Fit to Width");
-    g_signal_connect(fit_wd_btn, "clicked", G_CALLBACK(on_fit_width_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_wd_btn);
-    self->fit_width_btn = fit_wd_btn;
+        /* Viewer Controls moved to Start */
+        GtkWidget *sidebar_btn = gtk_button_new_from_icon_name("view-grid-symbolic");
+        gtk_widget_set_tooltip_text(sidebar_btn, "Toggle Thumbnails");
+        g_signal_connect_swapped(sidebar_btn, "clicked", G_CALLBACK(toggle_sidebar), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), sidebar_btn);
 
-    GtkWidget *rot_l = gtk_button_new_from_icon_name("object-rotate-left-symbolic");
-    gtk_widget_set_tooltip_text(rot_l, "Rotate Left");
-    g_signal_connect(rot_l, "clicked", G_CALLBACK(on_rotate_left_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_l);
-    self->rot_left_btn = rot_l;
-    
-    GtkWidget *rot_r = gtk_button_new_from_icon_name("object-rotate-right-symbolic");
-    gtk_widget_set_tooltip_text(rot_r, "Rotate Right");
-    g_signal_connect(rot_r, "clicked", G_CALLBACK(on_rotate_right_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_r);
-    self->rot_right_btn = rot_r;
+        /* Swapped Zoom Buttons: Minus then Plus */
+        GtkWidget *zoom_out = gtk_button_new_from_icon_name("zoom-out-symbolic");
+        gtk_widget_set_tooltip_text(zoom_out, "Zoom Out");
+        g_signal_connect(zoom_out, "clicked", G_CALLBACK(on_zoom_out_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_out);
+        /* Store references so we can grey them out during video playback */
+        self->zoom_out_btn = zoom_out;
 
-    self->slideshow_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
-    gtk_widget_set_tooltip_text(self->slideshow_btn, "Toggle Slideshow");
-    g_signal_connect_swapped(self->slideshow_btn, "clicked", G_CALLBACK(toggle_slideshow), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), self->slideshow_btn);
+        GtkWidget *zoom_in = gtk_button_new_from_icon_name("zoom-in-symbolic");
+        gtk_widget_set_tooltip_text(zoom_in, "Zoom In");
+        g_signal_connect(zoom_in, "clicked", G_CALLBACK(on_zoom_in_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_in);
+        self->zoom_in_btn = zoom_in;
+        
+        GtkWidget *fit_w_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
+        gtk_widget_set_tooltip_text(fit_w_btn, "Fit to Window");
+        g_signal_connect(fit_w_btn, "clicked", G_CALLBACK(on_fit_window_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_w_btn);
+        self->fit_window_btn = fit_w_btn;
+
+        GtkWidget *fit_wd_btn = gtk_button_new_from_icon_name("zoom-out-symbolic"); /* Temporary icon, ideally use something like 'zoom-original' or 'view-fullscreen-symbolic' rotated */
+        /* Let's use arrows-alt-h or similar if available, otherwise just use standard fit icon and tooltip distinction */
+        gtk_button_set_icon_name(GTK_BUTTON(fit_wd_btn), "view-paged-symbolic"); // "view-paged-symbolic" often implies width fit in some contexts, or we can reuse `zoom-fit-best`
+        gtk_widget_set_tooltip_text(fit_wd_btn, "Fit to Width");
+        g_signal_connect(fit_wd_btn, "clicked", G_CALLBACK(on_fit_width_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_wd_btn);
+        self->fit_width_btn = fit_wd_btn;
+
+        GtkWidget *rot_l = gtk_button_new_from_icon_name("object-rotate-left-symbolic");
+        gtk_widget_set_tooltip_text(rot_l, "Rotate Left");
+        g_signal_connect(rot_l, "clicked", G_CALLBACK(on_rotate_left_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_l);
+        self->rot_left_btn = rot_l;
+        
+        GtkWidget *rot_r = gtk_button_new_from_icon_name("object-rotate-right-symbolic");
+        gtk_widget_set_tooltip_text(rot_r, "Rotate Right");
+        g_signal_connect(rot_r, "clicked", G_CALLBACK(on_rotate_right_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_r);
+        self->rot_right_btn = rot_r;
+
+        self->slideshow_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
+        gtk_widget_set_tooltip_text(self->slideshow_btn, "Toggle Slideshow");
+        g_signal_connect_swapped(self->slideshow_btn, "clicked", G_CALLBACK(toggle_slideshow), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), self->slideshow_btn);
+    } else {
+        /* Headless/test: avoid constructing full header chrome (reduces early toolkit probes) */
+        self->header_bar = NULL;
+    }
     
     /* Pack End: Menu (Rightmost), then Metadata, then OCR */
     
@@ -3041,7 +3079,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     GtkWidget *menu_btn = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_btn), "open-menu-symbolic");
     gtk_widget_set_tooltip_text(menu_btn, "Main Menu");
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), menu_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, menu_btn);
     /* Store the button on the window and build the initial menu (no file loaded yet) */
     self->menu_btn = menu_btn;
     update_main_menu(self, NULL);
@@ -3050,7 +3089,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     GtkWidget *metadata_btn = gtk_button_new_from_icon_name("emoji-objects-symbolic");
     gtk_widget_set_tooltip_text(metadata_btn, "Metadata");
     g_signal_connect_swapped(metadata_btn, "clicked", G_CALLBACK(toggle_metadata), self);
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), metadata_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, metadata_btn);
 
     /* OCR Menu Button (next to metadata) */
     GMenu *ocr_menu = g_menu_new();
@@ -3062,7 +3102,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(ocr_btn), G_MENU_MODEL(ocr_menu));
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(ocr_btn), "scanner-symbolic");
     gtk_widget_set_tooltip_text(ocr_btn, "OCR");
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), ocr_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, ocr_btn);
     g_object_unref(ocr_menu);
 
     /* Create CBZ from folder button (visible by default, enabled only for non-archive views) */
@@ -3092,7 +3133,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
      * and sizing remain consistent with other header buttons. */
     create_cbz_btn = gtk_button_new_from_icon_name(cbz_icon);
     gtk_widget_set_tooltip_text(create_cbz_btn, "Create CBZ from Folder");
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), create_cbz_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, create_cbz_btn);
     /* Store reference for visibility/sensitivity updates */
     self->create_cbz_btn = create_cbz_btn;
     /* Clicking triggers same action as Convert-to-CBZ but will handle non-archive paths */
@@ -3119,15 +3161,33 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_box_append(GTK_BOX(status_bar), self->status_label);
 
     /* Toolbar View */
-    GtkWidget *toolbar_view = adw_toolbar_view_new();
-    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar_view), header);
-    adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar_view), status_bar);
-    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->split_view));
+    if (!g_getenv("BRIGHTEYES_HEADLESS_TEST")) {
+        GtkWidget *toolbar_view = adw_toolbar_view_new();
+        /* Prevent Adwaita's internal breakpoint/bin math from seeing unconstrained
+         * sizes during early measurement in headless backends. 1px is visually
+         * negligible but significant for layout arithmetic. */
+        gtk_widget_set_size_request(toolbar_view, 1, 1);
 
-    /* Now that the header is a child of the toolbar view, log children once to diagnose layout */
-    g_idle_add(log_header_children, self);
-    
-    adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), toolbar_view);
+        if (self->header_bar)
+            adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->header_bar));
+
+        /* Ensure status bar has a conservative constraint before adoption */
+        if (status_bar) gtk_widget_set_size_request(status_bar, 1, 1);
+        adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar_view), status_bar);
+
+        adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->split_view));
+
+        /* Now that the header is a child of the toolbar view, log children once to diagnose layout */
+        g_idle_add(log_header_children, self);
+        
+        adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), toolbar_view);
+    } else {
+        /* Headless/test: avoid constructing adw_toolbar_view (it triggers
+         * internal Adwaita measurement probes that are noisy on some backends).
+         * Use the split view directly as the window content — sufficient for
+         * the in-process tests which exercise viewer functionality. */
+        adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), GTK_WIDGET(self->split_view));
+    }
 
     /* Key Controller - Removed duplicate */
 

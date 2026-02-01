@@ -8,6 +8,7 @@ BrightEyes is a modern GTK4 image viewer written in C with libadwaita for GNOME 
 - Metadata viewing
 - Video playback (via GStreamer gtksink)
 - OCR via libtesseract
+- Export images (Save as PNG/JPEG) and support for modern formats such as WebP and AVIF when the platform GdkPixbuf loaders are available
 
 Build (development machine with necessary -dev packages):
 

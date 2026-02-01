@@ -1,0 +1,23 @@
+/* Very-small, conservative startup CSS — included in the GResource and applied
+ * as early as possible to prevent unconstrained toolkit measurement from
+ * producing negative/zero allocations in headless/back-end test runs.
+ * Keep rules minimal and visually neutral for normal usage. */
+
+/* Absolute fallback to avoid 0/negative allocation arithmetic */
+* { min-width: 1px; min-height: 1px; }
+
+/* Common high-level containers we see probed early by Adwaita/GTK */
+.adw-header-bar, .viewer-empty-state, .video-overlay, .viewer-scroller {
+  min-height: 36px;
+}
+
+.video-overlay { min-height: 40px; }
+.video-overlay button { min-height: 24px; min-width: 24px; }
+
+/* Thumbnails / icons */
+.thumbnail-picture, .thumbnail-icon, .type-overlay-icon { min-width: 1px; min-height: 1px; }
+
+/* Small note for maintainers */
+/* This file is intentionally conservative and should not change app layout
+ * in normal desktop runs. It exists solely to give the toolkit sensible
+ * numeric constraints during headless/layout-only probes. */
