@@ -3,6 +3,8 @@ name: Build DEB and attach to Release
 on:
   release:
     types: [created]
+  push:
+    tags: ['v*']
   workflow_dispatch: {}
 
 jobs:

@@ -1,0 +1,105 @@
+name: Packaging checks
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  deb-packaging-check:
+    name: DEB packaging check (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build build-essential \
+            libgtk-4-dev libadwaita-1-dev libgdk-pixbuf-2.0-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav \
+            ruby-full
+          sudo gem install --no-document fpm
+
+      - name: Configure & build
+        run: |
+          meson setup build --prefix=/usr
+          meson compile -C build
+
+      - name: Stage install
+        run: |
+          rm -rf /tmp/package
+          mkdir -p /tmp/package
+          meson install -C build --destdir=/tmp/package
+
+      - name: Create DEB (packaging-check)
+        run: |
+          VERSION="${{ github.ref_name || github.sha }}"
+          VERSION="${VERSION#v}"
+          mkdir -p artifacts
+          fpm -s dir -t deb -n brighteyes -v "$VERSION" --license MIT \
+            --url "https://github.com/jdwininger/BrightEyes" \
+            --description "BrightEyes image/video viewer" \
+            --depends "libgtk-4-1" \
+            --depends "libadwaita-1-0" \
+            --depends "libgstreamer1.0-0" \
+            -C /tmp/package .
+          mv *.deb artifacts/ || true
+          ls -l artifacts || true
+
+      - name: Upload DEB artifact (check)
+        uses: actions/upload-artifact@v4
+        with:
+          name: brighteyes-deb-check
+          path: artifacts/*.deb
+
+  rpm-packaging-check:
+    name: RPM packaging check (Fedora container)
+    runs-on: ubuntu-latest
+    needs: []
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build RPM inside Fedora container (check)
+        uses: addnab/docker-run-action@v3
+        with:
+          image: fedora:latest
+          options: --rm -v ${{ github.workspace }}:/workspace -e VERSION=${{ github.ref_name || github.sha }}
+          workdir: /workspace
+          run: |
+            set -euo pipefail
+            cd /workspace
+            dnf -y update
+            dnf -y install git meson ninja gcc pkgconfig gtk4-devel libadwaita-devel gdk-pixbuf2-devel \
+              gstreamer1-devel gstreamer1-plugins-base-devel \
+              tesseract-devel leptonica-devel libarchive-devel cmake rpm-build ruby rubygems make which
+            gem install --no-document fpm
+
+            rm -rf build || true
+            meson setup build .
+            meson compile -C build
+
+            rm -rf /tmp/package
+            mkdir -p /tmp/package
+            meson install -C build --destdir=/tmp/package
+
+            VERSION="${VERSION#v}"
+            fpm -s dir -t rpm -n brighteyes -v "$VERSION" --license MIT \
+                --url "https://github.com/jdwininger/BrightEyes" \
+                --description "BrightEyes image/video viewer" \
+                --iteration 1 \
+                -C /tmp/package .
+
+            mkdir -p artifacts
+            mv *.rpm artifacts/ || true
+            ls -l artifacts || true
+
+      - name: Upload RPM artifact (check)
+        uses: actions/upload-artifact@v4
+        with:
+          name: brighteyes-rpm-check
+          path: artifacts/*.rpm
