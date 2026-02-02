@@ -12,6 +12,8 @@ G_DECLARE_FINAL_TYPE(BrightEyesWindow, bright_eyes_window, BRIGHT_EYES, WINDOW, 
 BrightEyesWindow *bright_eyes_window_new(GtkApplication *app);
 void bright_eyes_window_open_file(BrightEyesWindow *self, const char *path);
 
+
+
 G_END_DECLS
 
 #endif /* WINDOW_H */

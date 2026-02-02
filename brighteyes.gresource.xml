@@ -3,5 +3,6 @@
   <gresource prefix="/org/jeremy/BrightEyes">
     <file alias="icons/hicolor/1024x1024/apps/org.jeremy.BrightEyes.png">icon-1024.png</file>
     <file alias="icons/hicolor/512x512/apps/org.jeremy.BrightEyes.png">icon-1024.png</file>
+    <file alias="styles/startup.css">data/styles/startup.css</file>
   </gresource>
 </gresources>

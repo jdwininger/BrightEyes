@@ -33,7 +33,7 @@ static gboolean
 is_image_name(const char *name)
 {
     if (!name) return FALSE;
-    const char *exts[] = { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".svg", ".webp", NULL };
+    const char *exts[] = { ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".svg", ".webp", ".avif", NULL };
     char *lower = g_ascii_strdown(name, -1);
     gboolean ok = FALSE;
     for (int i = 0; exts[i]; i++) {

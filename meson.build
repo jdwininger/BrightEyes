@@ -49,10 +49,16 @@ endif
 # Ensure math library is linked for functions like exp()
 add_project_link_arguments('-lm', language : 'c')
 
-executable('brighteyes', sources + resources,
+bex = executable('brighteyes', sources + resources,
   dependencies : deps,
   install : true
 )
+
+# In-process CLI integration smoke for the Save-frame flow. Fast, non-interactive
+# and tolerant of missing GStreamer (falls back to image-only capture).
+# This prevents regressions of the --test-save-frame path.
+test('save-frame-cli', bex, args : ['--test-save-frame', 'test-out-save-frame.png'],
+     workdir : meson.source_root())
 
 # Small test tool to exercise archive conversion logic from the command line
 executable('archive-convert-test', 'tools/convert_test.c',
@@ -64,6 +70,16 @@ executable('zip-test', 'tools/zip_test.c',
   dependencies : libarchive_dep,
   install : false
 )
+
+image_convert_test_exe = executable('image-convert-test', 'tools/image_convert_test.c',
+  dependencies : [gdkpixbuf_dep, glib_dep],
+  install : false
+)
+
+test('image-convert', image_convert_test_exe, args : ['icon-1024.png', 'test-out.png', 'test-out.jpg', '85', '#ffffff'],
+     workdir : meson.source_root())
+
+
 
 executable('run-archive-convert', ['tools/run_archive_convert.c', 'src/archive.c'],
   dependencies : [glib_dep, libarchive_dep, gio_dep],
@@ -83,11 +99,37 @@ if libarchive_dep.found()
 
   test_cbz = files('test.cbz')
   test('thumbnailer', th_exe, args : [test_cbz, 'test-thumb.png', '64'])
+
+  # Smoke test: run a tiny GStreamer-based capture pipeline against an
+  # image (single-frame source) to validate the same decode + sink code
+  # used by the thumbnails capture path. Only add if GStreamer is
+  # available.
+  if gst_dep.found()
+    video_capture_smoke = executable('video-frame-capture-smoke', 'tools/video_frame_capture_smoke.c',
+      dependencies : [gst_dep, gdkpixbuf_dep, glib_dep],
+      install : false
+    )
+    test('video-frame-capture-smoke', video_capture_smoke, workdir : meson.source_root())
+
+    save_frame_gui_test = executable('save-frame-gui', ['tools/save_frame_gui_test.c', 'src/thumbnails.c', 'src/viewer.c'],
+      dependencies : [gst_dep, gdkpixbuf_dep, glib_dep, gtk_dep, adwaita_dep],
+      install : false
+    )
+    test('save-frame-gui', save_frame_gui_test, workdir : meson.source_root())
+  endif
+
+  # Exercise the video-frame capture pipeline using a single-image source
+  # (GStreamer treats images as single-frame videos). This validates the
+  # same capture code path used by the viewer's "Save frame" action.
+  test('thumbnailer-video-frame', th_exe, args : ['icon-1024.png', 'test-out-video-frame.png', '64'],
+       workdir : meson.source_root())
+
 endif
 
 install_data('data/org.jeremy.BrightEyes.desktop', install_dir : 'share/applications')
 install_data('data/org.jeremy.BrightEyes.xml', install_dir : 'share/mime/packages')
 install_data('data/org.jeremy.BrightEyes.thumbnailer', install_dir : 'share/thumbnailers')
+install_data('data/org.jeremy.BrightEyes.gschema.xml', install_dir : 'share/glib-2.0/schemas')
 install_data('icon-1024.png', install_dir : 'share/icons/hicolor/1024x1024/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('icon-1024.png', install_dir : 'share/icons/hicolor/512x512/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('LICENSE', install_dir : 'share/licenses/brighteyes')

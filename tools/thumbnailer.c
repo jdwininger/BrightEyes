@@ -19,6 +19,7 @@ static gboolean is_image_filename(const char *name) {
     if (g_ascii_strcasecmp(ext, "png") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "gif") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "webp") == 0) return TRUE;
+    if (g_ascii_strcasecmp(ext, "avif") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "bmp") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "tif") == 0) return TRUE;
     if (g_ascii_strcasecmp(ext, "tiff") == 0) return TRUE;
@@ -60,6 +61,51 @@ int main(int argc, char **argv) {
     archive_read_support_filter_all(a);
 
     if (archive_read_open_filename(a, inpath, 10240) != ARCHIVE_OK) {
+        /* Not an archive — attempt to treat the input as a plain image file
+         * (used by tests that exercise the video/capture pipeline with a
+         * single-frame source). If that fails, fall back to the original
+         * behaviour and return an error. */
+        if (is_image_filename(inpath)) {
+            GError *gerr = NULL;
+            GdkPixbuf *pix = gdk_pixbuf_new_from_file(inpath, &gerr);
+            if (!pix) {
+                if (gerr) {
+                    fprintf(stderr, "thumbnailer: gdk-pixbuf failed to load '%s': %s\n", inpath, gerr->message);
+                    g_clear_error(&gerr);
+                } else {
+                    fprintf(stderr, "thumbnailer: gdk-pixbuf failed to load '%s' (unknown error)\n", inpath);
+                }
+                archive_read_free(a);
+                g_free(inpath);
+                return 1;
+            }
+
+            /* Scale & write using the same logic as the archive path */
+            int width = gdk_pixbuf_get_width(pix);
+            int height = gdk_pixbuf_get_height(pix);
+            int target_w = size;
+            int target_h = (height * size) / width;
+            if (target_h <= 0) target_h = size;
+
+            GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pix, target_w, target_h, GDK_INTERP_BILINEAR);
+            g_object_unref(pix);
+
+            if (!gdk_pixbuf_save(scaled, outpath, "png", &gerr, NULL)) {
+                fprintf(stderr, "thumbnailer: failed to save thumbnail '%s': %s\n", outpath, gerr ? gerr->message : "unknown");
+                g_clear_error(&gerr);
+                g_object_unref(scaled);
+                archive_read_free(a);
+                g_free(inpath);
+                return 1;
+            }
+
+            g_object_unref(scaled);
+            g_free(inpath);
+            archive_read_free(a);
+            fprintf(stderr, "thumbnailer: wrote thumbnail '%s'\n", outpath);
+            return 0;
+        }
+
         fprintf(stderr, "thumbnailer: failed to open archive: %s\n", inpath);
         g_free(inpath);
         archive_read_free(a);

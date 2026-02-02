@@ -296,24 +296,32 @@ update_zoom_ui_for_file_type(BrightEyesWindow *self, const char *path)
     gboolean is_comic = (path && g_str_has_prefix(path, "archive://"));
     g_debug("%s: path='%s' is_comic=%d create_cbz_btn=%p", __func__, path ? path : "(null)", is_comic, self->create_cbz_btn);
 
-    gtk_widget_set_visible(self->zoom_in_btn, !is_comic);
-    gtk_widget_set_visible(self->zoom_out_btn, !is_comic);
+    if (self->zoom_in_btn) gtk_widget_set_visible(self->zoom_in_btn, !is_comic);
+    if (self->zoom_out_btn) gtk_widget_set_visible(self->zoom_out_btn, !is_comic);
     if (self->create_cbz_btn) {
             gtk_widget_set_sensitive(self->create_cbz_btn, !is_comic);
-            int btn_w = gtk_widget_get_width(self->create_cbz_btn);
-            int btn_h = gtk_widget_get_height(self->create_cbz_btn);
-            int header_w = -1, header_h = -1;
-            if (self->header_bar) {
-                header_w = gtk_widget_get_width(GTK_WIDGET(self->header_bar));
-                header_h = gtk_widget_get_height(GTK_WIDGET(self->header_bar));
+            /* Avoid querying width/height before widgets are realized — doing so
+             * on some backends (Xvfb) produces spurious negative allocations and
+             * noisy warnings. Only read allocations when the widget is realized
+             * and has a positive size. */
+            if (gtk_widget_get_realized(self->create_cbz_btn) && gtk_widget_get_width(self->create_cbz_btn) > 0) {
+                int btn_w = gtk_widget_get_width(self->create_cbz_btn);
+                int btn_h = gtk_widget_get_height(self->create_cbz_btn);
+                int header_w = -1, header_h = -1;
+                if (self->header_bar && gtk_widget_get_realized(GTK_WIDGET(self->header_bar)) && gtk_widget_get_width(GTK_WIDGET(self->header_bar)) > 0) {
+                    header_w = gtk_widget_get_width(GTK_WIDGET(self->header_bar));
+                    header_h = gtk_widget_get_height(GTK_WIDGET(self->header_bar));
+                }
+                g_debug("%s: create_cbz_btn set_sensitive=%d visible=%d alloc=(%d,%d) header_alloc=(%d,%d)",
+                        __func__, !is_comic, gtk_widget_get_visible(self->create_cbz_btn), btn_w, btn_h, header_w, header_h);
+            } else {
+                g_debug("%s: create_cbz_btn not realized yet (visible=%d)", __func__, gtk_widget_get_visible(self->create_cbz_btn));
             }
-            g_debug("%s: create_cbz_btn set_sensitive=%d visible=%d alloc=(%d,%d) header_alloc=(%d,%d)",
-                    __func__, !is_comic, gtk_widget_get_visible(self->create_cbz_btn), btn_w, btn_h, header_w, header_h);
     }
     
     /* Ensure fit buttons are visible (they are always relevant) */
-    gtk_widget_set_visible(self->fit_window_btn, TRUE);
-    gtk_widget_set_visible(self->fit_width_btn, TRUE);
+    if (self->fit_window_btn) gtk_widget_set_visible(self->fit_window_btn, TRUE);
+    if (self->fit_width_btn) gtk_widget_set_visible(self->fit_width_btn, TRUE);
 }
 
 /* Public method to open a file */
@@ -325,7 +333,8 @@ load_image_path(BrightEyesWindow *self, const char *path)
     update_title(self);
     
     /* Update metadata whenever an image is loaded */
-    metadata_sidebar_update(self->metadata_sidebar, path);
+    if (self->metadata_sidebar)
+        metadata_sidebar_update(self->metadata_sidebar, path);
 
     /* Update actions */
     gboolean can_convert = FALSE;
@@ -345,6 +354,19 @@ load_image_path(BrightEyesWindow *self, const char *path)
     if (self->win_actions) {
         GAction *act = g_action_map_lookup_action(G_ACTION_MAP(self->win_actions), "convert-to-cbz");
         if (act) g_simple_action_set_enabled(G_SIMPLE_ACTION(act), can_convert);
+
+        /* Save-image: enabled when the current item is a regular image file */
+        gboolean can_save_image = FALSE;
+        if (path && !g_str_has_prefix(path, "archive://")) {
+            char *lower = g_ascii_strdown(path, -1);
+            if (g_str_has_suffix(lower, ".jpg") || g_str_has_suffix(lower, ".jpeg") || g_str_has_suffix(lower, ".png") ||
+                g_str_has_suffix(lower, ".bmp") || g_str_has_suffix(lower, ".gif") || g_str_has_suffix(lower, ".tiff") ||
+                g_str_has_suffix(lower, ".webp") || g_str_has_suffix(lower, ".avif"))
+                can_save_image = TRUE;
+            g_free(lower);
+        }
+        GAction *save_act = g_action_map_lookup_action(G_ACTION_MAP(self->win_actions), "save-image");
+        if (save_act) g_simple_action_set_enabled(G_SIMPLE_ACTION(save_act), can_save_image);
     }
     /* Rebuild top-level menu so the cheeseburger shows Convert-to-CBZ only
      * when viewing a .cbr archive (we place it at the top when present).
@@ -610,6 +632,359 @@ on_ocr_selection_action(GSimpleAction *action, GVariant *parameter, gpointer use
     viewer_clear_selection(self->viewer);
     viewer_set_selection_mode(self->viewer, FALSE);
 }
+/* Return a GSettings for the application schema, or NULL if the
+ * schema is not installed. DO NOT call g_settings_new() directly unless
+ * you have verified the schema exists — g_settings_new() will abort the
+ * process in that case. */
+static GSettings *
+get_settings_safe(void)
+{
+    GSettingsSchemaSource *src = g_settings_schema_source_get_default();
+    if (!src) return NULL;
+    if (!g_settings_schema_source_lookup(src, "org.jeremy.BrightEyes", TRUE))
+        return NULL;
+    return g_settings_new("org.jeremy.BrightEyes");
+}
+
+static void
+on_save_options_response(GtkDialog *dlg, gint response_id, gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+    if (response_id != GTK_RESPONSE_ACCEPT) {
+        gtk_window_destroy(GTK_WINDOW(dlg));
+        return;
+    }
+
+    /* Retrieve stored pointers */
+
+
+    char *dest = g_object_get_data(G_OBJECT(dlg), "dest-path");
+    const char *fmt = (const char *)g_object_get_data(G_OBJECT(dlg), "dest-format");
+    GtkWidget *quality_scale = g_object_get_data(G_OBJECT(dlg), "quality-scale");
+
+    int quality = (int)gtk_range_get_value(GTK_RANGE(quality_scale));
+
+    /* Read RGB from the non-deprecated spinbuttons packed into the dialog */
+    GtkSpinButton *r_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(dlg), "bg-r-spin"));
+    GtkSpinButton *g_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(dlg), "bg-g-spin"));
+    GtkSpinButton *b_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(dlg), "bg-b-spin"));
+    guint8 r = (guint8)CLAMP(gtk_spin_button_get_value_as_int(r_spin), 0, 255);
+    guint8 g = (guint8)CLAMP(gtk_spin_button_get_value_as_int(g_spin), 0, 255);
+    guint8 b = (guint8)CLAMP(gtk_spin_button_get_value_as_int(b_spin), 0, 255);
+
+    /* Persist choices to GSettings so they become the new defaults (if available) */
+    GSettings *settings = get_settings_safe();
+    if (settings) {
+        g_settings_set_int(settings, "jpeg-quality", quality);
+        char buf[32];
+        g_snprintf(buf, sizeof(buf), "#%02x%02x%02x", r, g, b);
+        g_settings_set_string(settings, "jpeg-bg-color", buf);
+        g_object_unref(settings);
+    } else {
+        g_warning("on_save_options_response: GSettings schema not installed; not persisting save options");
+    }
+
+    GError *save_err = NULL;
+    /* If the dialog was opened from the video 'Save frame' button, invoke
+     * the video-frame-specific save helper which captures the paused frame
+     * then writes the requested format. Otherwise fall back to saving the
+     * currently-displayed image. */
+    gboolean is_video_frame = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(dlg), "video-frame"));
+    gboolean ok = FALSE;
+    if (is_video_frame) {
+        ok = viewer_save_current_video_frame(self->viewer, dest, fmt, quality, r, g, b, &save_err);
+    } else {
+        ok = viewer_save_image(self->viewer, dest, fmt, quality, r, g, b, &save_err);
+    }
+
+    if (!ok) {
+        g_autofree char *msg = g_strdup_printf("Failed to save image: %s", save_err ? save_err->message : "unknown");
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+        g_clear_error(&save_err);
+    } else {
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Image saved"));
+    }
+
+    g_free(dest);
+    gtk_window_destroy(GTK_WINDOW(dlg));
+}
+
+/* Wrapper invoked by the Save button in the non-Dialog `show_save_options_dialog()`
+ * UI. It locates the dialog window ancestor and calls the shared response
+ * handler with GTK_RESPONSE_ACCEPT so the same save-path logic is used. */
+static void
+on_save_options_save_clicked(GtkButton *button, gpointer user_data)
+{
+    GtkWidget *w = GTK_WIDGET(button);
+    GtkWindow *dlg = GTK_WINDOW(gtk_widget_get_root(w));
+    if (!dlg) {
+        g_warning("on_save_options_save_clicked: could not find dialog window");
+        return;
+    }
+
+    /* forward to the central response handler */
+    on_save_options_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT, user_data);
+}
+
+/* forward-declare draw func so it can be used by dialog code above its definition */
+static void color_preview_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data);
+
+static void
+show_save_options_dialog(BrightEyesWindow *self, const char *dest_path, const char *format, gboolean is_video_frame)
+{
+    /* Modal dialog with JPEG quality slider and background color chooser */
+    GtkWindow *dlg = GTK_WINDOW(gtk_window_new());
+    gtk_window_set_transient_for(dlg, GTK_WINDOW(self));
+    gtk_window_set_modal(dlg, TRUE);
+    gtk_window_set_title(dlg, "Save options");
+
+    GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_top(content, 12);
+    gtk_widget_set_margin_bottom(content, 12);
+    gtk_widget_set_margin_start(content, 12);
+    gtk_widget_set_margin_end(content, 12);
+
+    /* Quality */
+    GtkWidget *q_label = gtk_label_new("JPEG quality:");
+    gtk_widget_set_halign(q_label, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(content), q_label);
+
+    GtkWidget *quality = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 1, 100, 1);
+    gtk_widget_set_hexpand(quality, TRUE);
+    gtk_box_append(GTK_BOX(content), quality);
+
+    /* Background color chooser (R/G/B spinboxes — avoids deprecated color APIs) */
+    GtkWidget *c_label = gtk_label_new("Background color for alpha flattening:");
+    gtk_widget_set_halign(c_label, GTK_ALIGN_START);
+    gtk_box_append(GTK_BOX(content), c_label);
+
+    GtkWidget *color_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_valign(color_box, GTK_ALIGN_CENTER);
+
+    /* Small color preview */
+    GtkWidget *preview = gtk_drawing_area_new();
+    gtk_widget_set_size_request(preview, 28, 18);
+    gtk_widget_set_margin_end(preview, 6);
+    gtk_box_append(GTK_BOX(color_box), preview);
+
+    GtkAdjustment *adj_r = gtk_adjustment_new(255, 0, 255, 1, 10, 0);
+    GtkWidget *r_spin = gtk_spin_button_new(GTK_ADJUSTMENT(adj_r), 1.0, 0);
+    gtk_widget_set_tooltip_text(r_spin, "Red (0-255)");
+    gtk_widget_set_valign(r_spin, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_end(r_spin, 4);
+    gtk_widget_set_size_request(r_spin, 60, -1);
+    gtk_widget_add_css_class(r_spin, "compact");
+    gtk_box_append(GTK_BOX(color_box), r_spin);
+
+    GtkAdjustment *adj_g = gtk_adjustment_new(255, 0, 255, 1, 10, 0);
+    GtkWidget *g_spin = gtk_spin_button_new(GTK_ADJUSTMENT(adj_g), 1.0, 0);
+    gtk_widget_set_tooltip_text(g_spin, "Green (0-255)");
+    gtk_widget_set_valign(g_spin, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_end(g_spin, 4);
+    gtk_widget_set_size_request(g_spin, 60, -1);
+    gtk_widget_add_css_class(g_spin, "compact");
+    gtk_box_append(GTK_BOX(color_box), g_spin);
+
+    GtkAdjustment *adj_b = gtk_adjustment_new(255, 0, 255, 1, 10, 0);
+    GtkWidget *b_spin = gtk_spin_button_new(GTK_ADJUSTMENT(adj_b), 1.0, 0);
+    gtk_widget_set_tooltip_text(b_spin, "Blue (0-255)");
+    gtk_widget_set_valign(b_spin, GTK_ALIGN_CENTER);
+    gtk_widget_set_size_request(b_spin, 60, -1);
+    gtk_widget_add_css_class(b_spin, "compact");
+    gtk_box_append(GTK_BOX(color_box), b_spin);
+
+    /* Link preview to the spinbuttons and ensure it redraws when values change */
+    g_object_set_data(G_OBJECT(preview), "r-spin", r_spin);
+    g_object_set_data(G_OBJECT(preview), "g-spin", g_spin);
+    g_object_set_data(G_OBJECT(preview), "b-spin", b_spin);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(r_spin)), "notify::value", G_CALLBACK(gtk_widget_queue_draw), preview);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(g_spin)), "notify::value", G_CALLBACK(gtk_widget_queue_draw), preview);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(b_spin)), "notify::value", G_CALLBACK(gtk_widget_queue_draw), preview);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(preview), color_preview_draw, NULL, NULL);
+
+    gtk_box_append(GTK_BOX(content), color_box);
+    gtk_box_set_spacing(GTK_BOX(content), 8);
+
+    /* Initialize from GSettings defaults (guarded) */
+    GSettings *settings = get_settings_safe();
+    if (!settings) {
+        g_warning("show_save_options_dialog: GSettings schema not installed; using defaults");
+        if (self->toast_overlay)
+            adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Settings unavailable — using defaults"));
+    }
+    int def_q = (int)g_settings_get_int(settings, "jpeg-quality");
+    const char *hex = g_settings_get_string(settings, "jpeg-bg-color");
+    if (hex) {
+        int rr, gg, bb;
+        if (sscanf(hex, "#%02x%02x%02x", &rr, &gg, &bb) == 3) {
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(r_spin), rr);
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_spin), gg);
+            gtk_spin_button_set_value(GTK_SPIN_BUTTON(b_spin), bb);
+        }
+        g_free((gpointer)hex);
+    }
+    gtk_range_set_value(GTK_RANGE(quality), def_q);
+    g_object_unref(settings);
+
+    /* Store spinbutton pointers so response handler can read them */
+    g_object_set_data(G_OBJECT(dlg), "bg-r-spin", r_spin);
+    g_object_set_data(G_OBJECT(dlg), "bg-g-spin", g_spin);
+    g_object_set_data(G_OBJECT(dlg), "bg-b-spin", b_spin);
+
+    /* Pack into the window */
+    gtk_window_set_child(dlg, content);
+
+    /* Action buttons: use a plain GtkBox (GTK4) */
+    GtkWidget *btn_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    GtkWidget *save = gtk_button_new_with_label("Save");
+    gtk_box_append(GTK_BOX(btn_box), cancel);
+    gtk_box_append(GTK_BOX(btn_box), save);
+    gtk_box_append(GTK_BOX(content), btn_box);
+
+
+
+
+    /* Store pointers for the response handler */
+    g_object_set_data_full(G_OBJECT(dlg), "dest-path", g_strdup(dest_path), g_free);
+    g_object_set_data(G_OBJECT(dlg), "dest-format", (gpointer)format);
+    g_object_set_data(G_OBJECT(dlg), "quality-scale", quality);
+    /* background color stored as three spinbuttons: bg-r-spin, bg-g-spin, bg-b-spin */
+    if (is_video_frame)
+        g_object_set_data(G_OBJECT(dlg), "video-frame", GINT_TO_POINTER(TRUE));
+
+    g_signal_connect(cancel, "clicked", G_CALLBACK(gtk_window_destroy), dlg);
+
+    /* The save button needs a small wrapper because `on_save_options_response`
+     * expects a dialog-style response (response id). Previously the button was
+     * connected directly to that function which caused the handler to early
+     * return. Connect to a dedicated wrapper that invokes the response
+     * handler with GTK_RESPONSE_ACCEPT. */
+    g_signal_connect(save, "clicked", G_CALLBACK(on_save_options_save_clicked), g_object_ref(self));
+
+    gtk_window_present(dlg);
+}
+
+static void
+on_save_image_response(GObject *source_object, GAsyncResult *res, gpointer user_data)
+{
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+    GError *error = NULL;
+    GFile *file = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source_object), res, &error);
+    if (!file) {
+        if (error) {
+            g_warning("Save dialog failed: %s", error->message);
+            g_clear_error(&error);
+        }
+        return;
+    }
+
+    char *path = g_file_get_path(file);
+    g_object_unref(file);
+    if (!path) return;
+
+    /* Determine format from extension */
+    const char *ext = strrchr(path, '.');
+    const char *fmt = "png";
+    if (ext) {
+        if (g_ascii_strcasecmp(ext, ".jpg") == 0 || g_ascii_strcasecmp(ext, ".jpeg") == 0)
+            fmt = "jpeg";
+        else if (g_ascii_strcasecmp(ext, ".png") == 0)
+            fmt = "png";
+    }
+
+    /* For JPEG we either show the options dialog (if configured) or use persisted defaults */
+    if (g_strcmp0(fmt, "jpeg") == 0) {
+        GSettings *settings = get_settings_safe();
+        gboolean ask = TRUE;
+        int def_q = 85;
+        guint8 br = 255, bg = 255, bb = 255;
+
+        if (settings) {
+            ask = g_settings_get_boolean(settings, "ask-save-options");
+            def_q = (int)g_settings_get_int(settings, "jpeg-quality");
+            char *hex = g_settings_get_string(settings, "jpeg-bg-color");
+            GdkRGBA rgba = {1.0, 1.0, 1.0, 1.0};
+            if (hex && gdk_rgba_parse(&rgba, hex)) {
+                br = (guint8)CLAMP((int)round(rgba.red * 255.0), 0, 255);
+                bg = (guint8)CLAMP((int)round(rgba.green * 255.0), 0, 255);
+                bb = (guint8)CLAMP((int)round(rgba.blue * 255.0), 0, 255);
+            }
+            g_free(hex);
+            g_object_unref(settings);
+        } else {
+            g_warning("on_save_image_response: GSettings schema not installed; using safe defaults and asking for options");
+            /* prefer to ask when we don't have persisted defaults */
+            ask = TRUE;
+        }
+
+        if (ask) {
+            /* Show options dialog which will call viewer_save_image when accepted. */
+            /* Copy path because dialog is asynchronous */
+            char *path_copy = g_strdup(path);
+            show_save_options_dialog(self, path_copy, fmt, FALSE);
+            g_free(path);
+            return;
+        } else {
+            GError *save_err = NULL;
+            if (!viewer_save_image(self->viewer, path, fmt, def_q, br, bg, bb, &save_err)) {
+                g_autofree char *msg = g_strdup_printf("Failed to save image: %s", save_err ? save_err->message : "unknown");
+                adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+                g_clear_error(&save_err);
+                g_free(path);
+                return;
+            }
+            adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Image saved"));
+            g_free(path);
+            return;
+        }
+    }
+
+    GError *save_err = NULL;
+    if (!viewer_save_image(self->viewer, path, fmt, 85, 255, 255, 255, &save_err)) {
+        g_autofree char *msg = g_strdup_printf("Failed to save image: %s", save_err ? save_err->message : "unknown");
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new(msg));
+        g_clear_error(&save_err);
+        g_free(path);
+        return;
+    }
+
+    adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Image saved"));
+    g_free(path);
+}
+
+
+static void
+on_save_image_action(GSimpleAction *action, GVariant *parameter, gpointer user_data)
+{
+    (void)action; (void)parameter;
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+
+    /* Suggest filename based on current file */
+    const char *current = curator_get_current(self->curator);
+    char *suggest = g_strdup("image.png");
+    if (current && !g_str_has_prefix(current, "archive://")) {
+        char *bn = g_path_get_basename(current);
+        char *dot = strrchr(bn, '.');
+        if (dot) *dot = '\0';
+        suggest = g_strdup_printf("%s.png", bn);
+        g_free(bn);
+    }
+
+    GtkFileDialog *dlg = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dlg, "Save Image As");
+    gtk_file_dialog_set_accept_label(dlg, "Save");
+
+    /* Add filters where supported would be ideal; keep UI simple and set an initial filename. */
+    GFile *initial = g_file_new_for_path(suggest);
+    gtk_file_dialog_set_initial_file(dlg, initial);
+    g_object_unref(initial);
+
+    /* Use the async API so we get a typed GFile in the completion callback. */
+    gtk_file_dialog_save(dlg, GTK_WINDOW(self), NULL, on_save_image_response, g_object_ref(self));
+    g_free(suggest);
+}
+
 static void
 show_open_dialog(BrightEyesWindow *self)
 {
@@ -1463,6 +1838,20 @@ update_main_menu(BrightEyesWindow *self, const char *path)
         g_menu_append(menu, "Convert to CBZ", "win.convert-to-cbz");
     }
 
+    /* If viewing a regular image file, expose Save Image */
+    gboolean is_image = FALSE;
+    if (path && !g_str_has_prefix(path, "archive://")) {
+        char *lower = g_ascii_strdown(path, -1);
+        if (g_str_has_suffix(lower, ".jpg") || g_str_has_suffix(lower, ".jpeg") || g_str_has_suffix(lower, ".png") ||
+            g_str_has_suffix(lower, ".bmp") || g_str_has_suffix(lower, ".gif") || g_str_has_suffix(lower, ".tiff") ||
+            g_str_has_suffix(lower, ".webp") || g_str_has_suffix(lower, ".avif"))
+            is_image = TRUE;
+        g_free(lower);
+    }
+    if (is_image) {
+        g_menu_append(menu, "Save Image As…", "win.save-image");
+    }
+
     g_menu_append(menu, "Preferences", "win.preferences");
     g_menu_append(menu, "Keyboard Shortcuts", "win.shortcuts");
     g_menu_append(menu, "About BrightEyes", "win.about");
@@ -1593,7 +1982,7 @@ on_convert_to_cbz_action(GSimpleAction *action, GVariant *parameter, gpointer us
         char *lower = g_ascii_strdown(entry, -1);
         if (g_str_has_suffix(lower, ".jpg") || g_str_has_suffix(lower, ".jpeg") || g_str_has_suffix(lower, ".png") ||
             g_str_has_suffix(lower, ".bmp") || g_str_has_suffix(lower, ".gif") || g_str_has_suffix(lower, ".tiff") ||
-            g_str_has_suffix(lower, ".webp") ) {
+            g_str_has_suffix(lower, ".webp") || g_str_has_suffix(lower, ".avif") ) {
             char *full = g_build_filename(folder, entry, NULL);
             g_ptr_array_add(images, full);
         }
@@ -1865,6 +2254,96 @@ on_ocr_language_changed(AdwComboRow *row, GParamSpec *pspec, BrightEyesWindow *s
 }
 
 static void
+on_jpeg_quality_changed(GtkAdjustment *adj, GParamSpec *pspec, gpointer user_data)
+{
+    GSettings *s = G_SETTINGS(user_data);
+    int v = (int)gtk_adjustment_get_value(adj);
+    g_settings_set_int(s, "jpeg-quality", v);
+}
+
+
+/* New: handler for the RGB spinbuttons used in preferences/save-options.
+ * Reads the three spinbuttons (stored on the preferences container) and
+ * writes the hex color string into GSettings. This avoids using the
+ * deprecated GtkColorChooser APIs while keeping the same persisted value.
+ */
+static void
+on_jpeg_bgcolor_spins_changed(GObject *unused, GParamSpec *pspec, gpointer user_data)
+{
+    /* user_data is the preferences container where spinbuttons are stored */
+    GObject *container = G_OBJECT(user_data);
+    GtkSpinButton *r_spin = GTK_SPIN_BUTTON(g_object_get_data(container, "pref-bg-r"));
+    GtkSpinButton *g_spin = GTK_SPIN_BUTTON(g_object_get_data(container, "pref-bg-g"));
+    GtkSpinButton *b_spin = GTK_SPIN_BUTTON(g_object_get_data(container, "pref-bg-b"));
+    if (!r_spin || !g_spin || !b_spin) return;
+
+    int rr = gtk_spin_button_get_value_as_int(r_spin);
+    int gg = gtk_spin_button_get_value_as_int(g_spin);
+    int bb = gtk_spin_button_get_value_as_int(b_spin);
+
+    char buf[32];
+    g_snprintf(buf, sizeof(buf), "#%02x%02x%02x",
+               CLAMP(rr, 0, 255), CLAMP(gg, 0, 255), CLAMP(bb, 0, 255));
+
+    GSettings *s = get_settings_safe();
+    if (s) {
+        g_settings_set_string(s, "jpeg-bg-color", buf);
+        g_object_unref(s);
+    } else {
+        g_warning("on_jpeg_bgcolor_spins_changed: GSettings schema not installed; not persisting color change");
+    }
+
+    /* Update any linked preview widget (if present) */
+    GtkWidget *preview = GTK_WIDGET(g_object_get_data(container, "pref-bg-preview"));
+    if (preview) gtk_widget_queue_draw(preview);
+}
+
+/* Draw callback for the small color-preview used next to RGB spinboxes.
+ * Reads the values from the associated spinbuttons (stored on the preview)
+ * and paints a rounded rectangle filled with the resulting color.
+ */
+static void
+color_preview_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data)
+{
+    (void)user_data;
+    GtkSpinButton *r_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(area), "r-spin"));
+    GtkSpinButton *g_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(area), "g-spin"));
+    GtkSpinButton *b_spin = GTK_SPIN_BUTTON(g_object_get_data(G_OBJECT(area), "b-spin"));
+    guint8 rr = 255, gg = 255, bb = 255;
+    if (r_spin) rr = (guint8)gtk_spin_button_get_value_as_int(r_spin);
+    if (g_spin) gg = (guint8)gtk_spin_button_get_value_as_int(g_spin);
+    if (b_spin) bb = (guint8)gtk_spin_button_get_value_as_int(b_spin);
+
+    double red = rr / 255.0;
+    double green = gg / 255.0;
+    double blue = bb / 255.0;
+
+    /* Rounded rect */
+    double rad = MIN(width, height) * 0.15;
+    double x = 0.5, y = 0.5, w = width - 1.0, h = height - 1.0;
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, x + w - rad, y + rad, rad, -G_PI/2.0, 0.0);
+    cairo_arc(cr, x + w - rad, y + h - rad, rad, 0.0, G_PI/2.0);
+    cairo_arc(cr, x + rad,     y + h - rad, rad, G_PI/2.0, G_PI);
+    cairo_arc(cr, x + rad,     y + rad,     rad, G_PI, 3.0*G_PI/2.0);
+    cairo_close_path(cr);
+
+    cairo_set_source_rgb(cr, red, green, blue);
+    cairo_fill_preserve(cr);
+    cairo_set_line_width(cr, 1.0);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.2);
+    cairo_stroke(cr);
+}
+
+static gboolean
+on_ask_save_options_toggled(GtkSwitch *sw, gboolean state, gpointer user_data)
+{
+    GSettings *s = G_SETTINGS(user_data);
+    g_settings_set_boolean(s, "ask-save-options", state);
+    return FALSE;
+}
+
+static void
 on_preferences_action(GSimpleAction *action, GVariant *parameter, gpointer user_data)
 {
     BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
@@ -1985,7 +2464,123 @@ on_preferences_action(GSimpleAction *action, GVariant *parameter, gpointer user_
     GtkAdjustment *adj = adw_spin_row_get_adjustment(spin_row);
     g_signal_connect(adj, "notify::value", G_CALLBACK(on_duration_changed), self);
     adw_preferences_group_add(viewer_group, GTK_WIDGET(spin_row));
-    
+
+    /* --- Export defaults (persisted via GSettings) --- */
+    GSettings *settings = get_settings_safe();
+
+    /* JPEG quality (1-100) */
+    AdwSpinRow *jpeg_q_row = ADW_SPIN_ROW(adw_spin_row_new_with_range(1.0, 100.0, 1.0));
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(jpeg_q_row), "JPEG export quality");
+    adw_action_row_set_subtitle(ADW_ACTION_ROW(jpeg_q_row), "Default quality used when exporting to JPEG");
+    int def_q = 85;
+    if (settings) {
+        def_q = (int)g_settings_get_int(settings, "jpeg-quality");
+        g_signal_connect(adw_spin_row_get_adjustment(jpeg_q_row), "notify::value",
+                         G_CALLBACK(on_jpeg_quality_changed), g_object_ref(settings));
+    } else {
+        g_warning("Preferences: GSettings schema not installed; using defaults for export settings");
+        if (self->toast_overlay)
+            adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Settings schema missing — defaults in use"));
+    }
+    adw_spin_row_set_value(jpeg_q_row, (double)def_q);
+    adw_preferences_group_add(viewer_group, GTK_WIDGET(jpeg_q_row));
+
+    /* Background color for alpha flattening (spinboxes to avoid deprecated APIs) */
+    AdwActionRow *jpeg_bg_action_row = ADW_ACTION_ROW(adw_action_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(jpeg_bg_action_row), "JPEG background color");
+    adw_action_row_set_subtitle(jpeg_bg_action_row, "Color used to flatten alpha when exporting to JPEG");
+
+    GtkWidget *color_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+
+    /* small preview */
+    GtkWidget *preview = gtk_drawing_area_new();
+    gtk_widget_set_size_request(preview, 28, 18);
+    gtk_widget_set_margin_end(preview, 6);
+    gtk_box_append(GTK_BOX(color_box), preview);
+
+    GtkAdjustment *adj_r = gtk_adjustment_new(255, 0, 255, 1, 10, 0);
+    GtkWidget *r_spin = gtk_spin_button_new(GTK_ADJUSTMENT(adj_r), 1.0, 0);
+    gtk_widget_set_tooltip_text(r_spin, "Red (0-255)");
+    gtk_widget_set_valign(r_spin, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_end(r_spin, 4);
+    gtk_widget_set_size_request(r_spin, 60, -1);
+    gtk_widget_add_css_class(r_spin, "compact");
+    gtk_box_append(GTK_BOX(color_box), r_spin);
+
+    GtkAdjustment *adj_g = gtk_adjustment_new(255, 0, 255, 1, 10, 0);
+    GtkWidget *g_spin = gtk_spin_button_new(GTK_ADJUSTMENT(adj_g), 1.0, 0);
+    gtk_widget_set_tooltip_text(g_spin, "Green (0-255)");
+    gtk_widget_set_valign(g_spin, GTK_ALIGN_CENTER);
+    gtk_widget_set_margin_end(g_spin, 4);
+    gtk_widget_set_size_request(g_spin, 60, -1);
+    gtk_widget_add_css_class(g_spin, "compact");
+    gtk_box_append(GTK_BOX(color_box), g_spin);
+
+    GtkAdjustment *adj_b = gtk_adjustment_new(255, 0, 255, 1, 10, 0);
+    GtkWidget *b_spin = gtk_spin_button_new(GTK_ADJUSTMENT(adj_b), 1.0, 0);
+    gtk_widget_set_tooltip_text(b_spin, "Blue (0-255)");
+    gtk_widget_set_valign(b_spin, GTK_ALIGN_CENTER);
+    gtk_widget_set_size_request(b_spin, 60, -1);
+    gtk_widget_add_css_class(b_spin, "compact");
+    gtk_box_append(GTK_BOX(color_box), b_spin);
+
+    adw_action_row_add_suffix(jpeg_bg_action_row, color_box);
+
+    /* wire preview -> spins */
+    g_object_set_data(G_OBJECT(preview), "r-spin", r_spin);
+    g_object_set_data(G_OBJECT(preview), "g-spin", g_spin);
+    g_object_set_data(G_OBJECT(preview), "b-spin", b_spin);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(r_spin)), "notify::value", G_CALLBACK(gtk_widget_queue_draw), preview);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(g_spin)), "notify::value", G_CALLBACK(gtk_widget_queue_draw), preview);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(b_spin)), "notify::value", G_CALLBACK(gtk_widget_queue_draw), preview);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(preview), color_preview_draw, NULL, NULL);
+
+    /* Initialize from settings (if available) */
+    if (settings) {
+        const char *hex = g_settings_get_string(settings, "jpeg-bg-color");
+        if (hex) {
+            int rr, gg, bb;
+            if (sscanf(hex, "#%02x%02x%02x", &rr, &gg, &bb) == 3) {
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(r_spin), rr);
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_spin), gg);
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(b_spin), bb);
+            }
+            g_free((gpointer)hex);
+        }
+    }
+
+    /* Store references on the action-row and connect changes to write back into GSettings */
+    g_object_set_data(G_OBJECT(jpeg_bg_action_row), "pref-bg-r", r_spin);
+    g_object_set_data(G_OBJECT(jpeg_bg_action_row), "pref-bg-g", g_spin);
+    g_object_set_data(G_OBJECT(jpeg_bg_action_row), "pref-bg-b", b_spin);
+    /* keep a pointer to the preview so the handler can queue redraws */
+    g_object_set_data(G_OBJECT(jpeg_bg_action_row), "pref-bg-preview", preview);
+
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(r_spin)), "notify::value", G_CALLBACK(on_jpeg_bgcolor_spins_changed), jpeg_bg_action_row);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(g_spin)), "notify::value", G_CALLBACK(on_jpeg_bgcolor_spins_changed), jpeg_bg_action_row);
+    g_signal_connect(gtk_spin_button_get_adjustment(GTK_SPIN_BUTTON(b_spin)), "notify::value", G_CALLBACK(on_jpeg_bgcolor_spins_changed), jpeg_bg_action_row);
+
+    if (settings) adw_preferences_group_add(viewer_group, GTK_WIDGET(jpeg_bg_action_row));
+    else adw_preferences_group_add(viewer_group, GTK_WIDGET(jpeg_bg_action_row));
+
+    /* Ask for save options toggle */
+    AdwActionRow *ask_action_row = ADW_ACTION_ROW(adw_action_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(ask_action_row), "Ask for save options when exporting JPEGs");
+    GtkSwitch *ask_switch = GTK_SWITCH(gtk_switch_new());
+    gboolean ask_def = TRUE;
+    if (settings) {
+        ask_def = g_settings_get_boolean(settings, "ask-save-options");
+        g_signal_connect(ask_switch, "state-set", G_CALLBACK(on_ask_save_options_toggled), g_object_ref(settings));
+    } else {
+        g_warning("Preferences: 'ask-save-options' GSettings key unavailable; defaulting to TRUE");
+    }
+    gtk_switch_set_active(ask_switch, ask_def);
+    adw_action_row_add_suffix(ask_action_row, GTK_WIDGET(ask_switch));
+    adw_preferences_group_add(viewer_group, GTK_WIDGET(ask_action_row));
+
+    /* Bindings created; drop local ref */
+    g_object_unref(settings);
+
     adw_preferences_page_add(page_viewer, ADW_PREFERENCES_GROUP(viewer_group));
 
 
@@ -2278,10 +2873,38 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_window_set_default_size(GTK_WINDOW(self), 1000, 700);
     gtk_window_set_title(GTK_WINDOW(self), "BrightEyes");
 
+    /* Headless / test mode: build a minimal window that contains only the
+     * Viewer. This avoids creating complex Adwaita widgets (toolbar view,
+     * overlay split view, dialog hosts, etc.) which trigger early layout
+     * probes on some headless backends. Keep this behaviour strictly
+     * test-only and conservative. */
+    if (g_getenv("BRIGHTEYES_HEADLESS_TEST")) {
+        /* Viewer */
+        self->viewer = viewer_new();
+        viewer_set_dark_background(self->viewer, self->viewer_dark_background);
+        viewer_set_default_fit(self->viewer, self->default_fit_to_window);
+
+        /* Put viewer directly into the toplevel (avoids Adw containers) */
+        gtk_window_set_child(GTK_WINDOW(self), GTK_WIDGET(self->viewer));
+
+        /* Ensure deterministic sizing for headless runs */
+        gtk_window_set_default_size(GTK_WINDOW(self), 800, 600);
+        gtk_widget_set_size_request(GTK_WIDGET(self), 800, 600);
+
+        /* Minimal key controller so shortcuts don't crash when installed */
+        GtkEventController *key_controller = gtk_event_controller_key_new();
+        g_signal_connect(key_controller, "key-pressed", G_CALLBACK(on_window_key_pressed), self);
+        gtk_widget_add_controller(GTK_WIDGET(self), key_controller);
+
+        return;
+    }
+
     /* Inner Split View (Metadata) - Sidebar at End */
     self->metadata_view = ADW_OVERLAY_SPLIT_VIEW(adw_overlay_split_view_new());
     adw_overlay_split_view_set_sidebar_position(self->metadata_view, GTK_PACK_END);
     adw_overlay_split_view_set_show_sidebar(self->metadata_view, FALSE);
+    /* Conservative minimum so early measurement sees a sane constraint */
+    gtk_widget_set_size_request(GTK_WIDGET(self->metadata_view), 1, 1);
 
     /* Construct Metadata Sidebar */
     self->metadata_sidebar = metadata_sidebar_new();
@@ -2328,6 +2951,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), hud_box);
 
     adw_toast_overlay_set_child(ADW_TOAST_OVERLAY(self->toast_overlay), overlay);
+    /* Conservative minimum so early measurement sees a sane constraint */
+    gtk_widget_set_size_request(GTK_WIDGET(self->toast_overlay), 1, 1);
     adw_overlay_split_view_set_content(self->metadata_view, self->toast_overlay);
     
     /* Connect viewer signals */
@@ -2351,75 +2976,82 @@ bright_eyes_window_init(BrightEyesWindow *self)
     adw_overlay_split_view_set_content(self->split_view, GTK_WIDGET(self->metadata_view));
 
     /* Header Bar */
-    GtkWidget *header = adw_header_bar_new();
-    /* Keep a reference to the header bar on the window for diagnostics and updates */
-    self->header_bar = ADW_HEADER_BAR(header);
-    
-    /* Pack Start: Open Files, Then Viewer Controls */
-    GtkWidget *open_btn = gtk_button_new_from_icon_name("document-open-symbolic");
-    gtk_widget_set_tooltip_text(open_btn, "Open File");
-    g_signal_connect_swapped(open_btn, "clicked", G_CALLBACK(show_open_dialog), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), open_btn);
-    
-    GtkWidget *folder_btn = gtk_button_new_from_icon_name("folder-open-symbolic");
-    gtk_widget_set_tooltip_text(folder_btn, "Open Folder");
-    g_signal_connect_swapped(folder_btn, "clicked", G_CALLBACK(show_open_folder_dialog), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), folder_btn);
+    if (!g_getenv("BRIGHTEYES_HEADLESS_TEST")) {
+        GtkWidget *header = adw_header_bar_new();
+        /* Conservative minimum so early measurement sees a sane constraint */
+        gtk_widget_set_size_request(header, 1, 1);
+        /* Keep a reference to the header bar on the window for diagnostics and updates */
+        self->header_bar = ADW_HEADER_BAR(header);
 
-    /* Separator */
-    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), sep);
+        /* Pack Start: Open Files, Then Viewer Controls */
+        GtkWidget *open_btn = gtk_button_new_from_icon_name("document-open-symbolic");
+        gtk_widget_set_tooltip_text(open_btn, "Open File");
+        g_signal_connect_swapped(open_btn, "clicked", G_CALLBACK(show_open_dialog), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), open_btn);
 
-    /* Viewer Controls moved to Start */
-    GtkWidget *sidebar_btn = gtk_button_new_from_icon_name("view-grid-symbolic");
-    gtk_widget_set_tooltip_text(sidebar_btn, "Toggle Thumbnails");
-    g_signal_connect_swapped(sidebar_btn, "clicked", G_CALLBACK(toggle_sidebar), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), sidebar_btn);
-    
-    /* Swapped Zoom Buttons: Minus then Plus */
-    GtkWidget *zoom_out = gtk_button_new_from_icon_name("zoom-out-symbolic");
-    gtk_widget_set_tooltip_text(zoom_out, "Zoom Out");
-    g_signal_connect(zoom_out, "clicked", G_CALLBACK(on_zoom_out_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_out);
-    /* Store references so we can grey them out during video playback */
-    self->zoom_out_btn = zoom_out;
+        GtkWidget *folder_btn = gtk_button_new_from_icon_name("folder-open-symbolic");
+        gtk_widget_set_tooltip_text(folder_btn, "Open Folder");
+        g_signal_connect_swapped(folder_btn, "clicked", G_CALLBACK(show_open_folder_dialog), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), folder_btn);
 
-    GtkWidget *zoom_in = gtk_button_new_from_icon_name("zoom-in-symbolic");
-    gtk_widget_set_tooltip_text(zoom_in, "Zoom In");
-    g_signal_connect(zoom_in, "clicked", G_CALLBACK(on_zoom_in_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_in);
-    self->zoom_in_btn = zoom_in;
-    
-    GtkWidget *fit_w_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
-    gtk_widget_set_tooltip_text(fit_w_btn, "Fit to Window");
-    g_signal_connect(fit_w_btn, "clicked", G_CALLBACK(on_fit_window_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_w_btn);
-    self->fit_window_btn = fit_w_btn;
+        /* Separator */
+        GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), sep);
 
-    GtkWidget *fit_wd_btn = gtk_button_new_from_icon_name("zoom-out-symbolic"); /* Temporary icon, ideally use something like 'zoom-original' or 'view-fullscreen-symbolic' rotated */
-    /* Let's use arrows-alt-h or similar if available, otherwise just use standard fit icon and tooltip distinction */
-    gtk_button_set_icon_name(GTK_BUTTON(fit_wd_btn), "view-paged-symbolic"); // "view-paged-symbolic" often implies width fit in some contexts, or we can reuse `zoom-fit-best`
-    gtk_widget_set_tooltip_text(fit_wd_btn, "Fit to Width");
-    g_signal_connect(fit_wd_btn, "clicked", G_CALLBACK(on_fit_width_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_wd_btn);
-    self->fit_width_btn = fit_wd_btn;
+        /* Viewer Controls moved to Start */
+        GtkWidget *sidebar_btn = gtk_button_new_from_icon_name("view-grid-symbolic");
+        gtk_widget_set_tooltip_text(sidebar_btn, "Toggle Thumbnails");
+        g_signal_connect_swapped(sidebar_btn, "clicked", G_CALLBACK(toggle_sidebar), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), sidebar_btn);
 
-    GtkWidget *rot_l = gtk_button_new_from_icon_name("object-rotate-left-symbolic");
-    gtk_widget_set_tooltip_text(rot_l, "Rotate Left");
-    g_signal_connect(rot_l, "clicked", G_CALLBACK(on_rotate_left_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_l);
-    self->rot_left_btn = rot_l;
-    
-    GtkWidget *rot_r = gtk_button_new_from_icon_name("object-rotate-right-symbolic");
-    gtk_widget_set_tooltip_text(rot_r, "Rotate Right");
-    g_signal_connect(rot_r, "clicked", G_CALLBACK(on_rotate_right_clicked), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_r);
-    self->rot_right_btn = rot_r;
+        /* Swapped Zoom Buttons: Minus then Plus */
+        GtkWidget *zoom_out = gtk_button_new_from_icon_name("zoom-out-symbolic");
+        gtk_widget_set_tooltip_text(zoom_out, "Zoom Out");
+        g_signal_connect(zoom_out, "clicked", G_CALLBACK(on_zoom_out_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_out);
+        /* Store references so we can grey them out during video playback */
+        self->zoom_out_btn = zoom_out;
 
-    self->slideshow_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
-    gtk_widget_set_tooltip_text(self->slideshow_btn, "Toggle Slideshow");
-    g_signal_connect_swapped(self->slideshow_btn, "clicked", G_CALLBACK(toggle_slideshow), self);
-    adw_header_bar_pack_start(ADW_HEADER_BAR(header), self->slideshow_btn);
+        GtkWidget *zoom_in = gtk_button_new_from_icon_name("zoom-in-symbolic");
+        gtk_widget_set_tooltip_text(zoom_in, "Zoom In");
+        g_signal_connect(zoom_in, "clicked", G_CALLBACK(on_zoom_in_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), zoom_in);
+        self->zoom_in_btn = zoom_in;
+        
+        GtkWidget *fit_w_btn = gtk_button_new_from_icon_name("zoom-fit-best-symbolic");
+        gtk_widget_set_tooltip_text(fit_w_btn, "Fit to Window");
+        g_signal_connect(fit_w_btn, "clicked", G_CALLBACK(on_fit_window_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_w_btn);
+        self->fit_window_btn = fit_w_btn;
+
+        GtkWidget *fit_wd_btn = gtk_button_new_from_icon_name("zoom-out-symbolic"); /* Temporary icon, ideally use something like 'zoom-original' or 'view-fullscreen-symbolic' rotated */
+        /* Let's use arrows-alt-h or similar if available, otherwise just use standard fit icon and tooltip distinction */
+        gtk_button_set_icon_name(GTK_BUTTON(fit_wd_btn), "view-paged-symbolic"); // "view-paged-symbolic" often implies width fit in some contexts, or we can reuse `zoom-fit-best`
+        gtk_widget_set_tooltip_text(fit_wd_btn, "Fit to Width");
+        g_signal_connect(fit_wd_btn, "clicked", G_CALLBACK(on_fit_width_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), fit_wd_btn);
+        self->fit_width_btn = fit_wd_btn;
+
+        GtkWidget *rot_l = gtk_button_new_from_icon_name("object-rotate-left-symbolic");
+        gtk_widget_set_tooltip_text(rot_l, "Rotate Left");
+        g_signal_connect(rot_l, "clicked", G_CALLBACK(on_rotate_left_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_l);
+        self->rot_left_btn = rot_l;
+        
+        GtkWidget *rot_r = gtk_button_new_from_icon_name("object-rotate-right-symbolic");
+        gtk_widget_set_tooltip_text(rot_r, "Rotate Right");
+        g_signal_connect(rot_r, "clicked", G_CALLBACK(on_rotate_right_clicked), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), rot_r);
+        self->rot_right_btn = rot_r;
+
+        self->slideshow_btn = gtk_button_new_from_icon_name("media-playback-start-symbolic");
+        gtk_widget_set_tooltip_text(self->slideshow_btn, "Toggle Slideshow");
+        g_signal_connect_swapped(self->slideshow_btn, "clicked", G_CALLBACK(toggle_slideshow), self);
+        adw_header_bar_pack_start(ADW_HEADER_BAR(header), self->slideshow_btn);
+    } else {
+        /* Headless/test: avoid constructing full header chrome (reduces early toolkit probes) */
+        self->header_bar = NULL;
+    }
     
     /* Pack End: Menu (Rightmost), then Metadata, then OCR */
     
@@ -2433,6 +3065,7 @@ bright_eyes_window_init(BrightEyesWindow *self)
         { "about", on_about_action, NULL, NULL, NULL },
         { "open-editor", on_open_editor_action, NULL, NULL, NULL },
         { "convert-to-cbz", on_convert_to_cbz_action, NULL, NULL, NULL },
+        { "save-image", on_save_image_action, NULL, NULL, NULL },
         { "ocr-whole", on_ocr_whole_action, NULL, NULL, NULL },
         { "ocr-selection", on_ocr_selection_action, NULL, NULL, NULL },
         { "clear-selection", on_clear_selection_action, NULL, NULL, NULL }
@@ -2446,7 +3079,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     GtkWidget *menu_btn = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(menu_btn), "open-menu-symbolic");
     gtk_widget_set_tooltip_text(menu_btn, "Main Menu");
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), menu_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, menu_btn);
     /* Store the button on the window and build the initial menu (no file loaded yet) */
     self->menu_btn = menu_btn;
     update_main_menu(self, NULL);
@@ -2455,7 +3089,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     GtkWidget *metadata_btn = gtk_button_new_from_icon_name("emoji-objects-symbolic");
     gtk_widget_set_tooltip_text(metadata_btn, "Metadata");
     g_signal_connect_swapped(metadata_btn, "clicked", G_CALLBACK(toggle_metadata), self);
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), metadata_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, metadata_btn);
 
     /* OCR Menu Button (next to metadata) */
     GMenu *ocr_menu = g_menu_new();
@@ -2467,7 +3102,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(ocr_btn), G_MENU_MODEL(ocr_menu));
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(ocr_btn), "scanner-symbolic");
     gtk_widget_set_tooltip_text(ocr_btn, "OCR");
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), ocr_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, ocr_btn);
     g_object_unref(ocr_menu);
 
     /* Create CBZ from folder button (visible by default, enabled only for non-archive views) */
@@ -2497,7 +3133,8 @@ bright_eyes_window_init(BrightEyesWindow *self)
      * and sizing remain consistent with other header buttons. */
     create_cbz_btn = gtk_button_new_from_icon_name(cbz_icon);
     gtk_widget_set_tooltip_text(create_cbz_btn, "Create CBZ from Folder");
-    adw_header_bar_pack_end(ADW_HEADER_BAR(header), create_cbz_btn);
+    if (self->header_bar)
+        adw_header_bar_pack_end(self->header_bar, create_cbz_btn);
     /* Store reference for visibility/sensitivity updates */
     self->create_cbz_btn = create_cbz_btn;
     /* Clicking triggers same action as Convert-to-CBZ but will handle non-archive paths */
@@ -2524,15 +3161,33 @@ bright_eyes_window_init(BrightEyesWindow *self)
     gtk_box_append(GTK_BOX(status_bar), self->status_label);
 
     /* Toolbar View */
-    GtkWidget *toolbar_view = adw_toolbar_view_new();
-    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar_view), header);
-    adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar_view), status_bar);
-    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->split_view));
+    if (!g_getenv("BRIGHTEYES_HEADLESS_TEST")) {
+        GtkWidget *toolbar_view = adw_toolbar_view_new();
+        /* Prevent Adwaita's internal breakpoint/bin math from seeing unconstrained
+         * sizes during early measurement in headless backends. 1px is visually
+         * negligible but significant for layout arithmetic. */
+        gtk_widget_set_size_request(toolbar_view, 1, 1);
 
-    /* Now that the header is a child of the toolbar view, log children once to diagnose layout */
-    g_idle_add(log_header_children, self);
-    
-    adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), toolbar_view);
+        if (self->header_bar)
+            adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->header_bar));
+
+        /* Ensure status bar has a conservative constraint before adoption */
+        if (status_bar) gtk_widget_set_size_request(status_bar, 1, 1);
+        adw_toolbar_view_add_bottom_bar(ADW_TOOLBAR_VIEW(toolbar_view), status_bar);
+
+        adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(toolbar_view), GTK_WIDGET(self->split_view));
+
+        /* Now that the header is a child of the toolbar view, log children once to diagnose layout */
+        g_idle_add(log_header_children, self);
+        
+        adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), toolbar_view);
+    } else {
+        /* Headless/test: avoid constructing adw_toolbar_view (it triggers
+         * internal Adwaita measurement probes that are noisy on some backends).
+         * Use the split view directly as the window content — sufficient for
+         * the in-process tests which exercise viewer functionality. */
+        adw_application_window_set_content(ADW_APPLICATION_WINDOW(self), GTK_WIDGET(self->split_view));
+    }
 
     /* Key Controller - Removed duplicate */
 

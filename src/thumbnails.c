@@ -286,6 +286,68 @@ lru_cache_destroy(void)
 
 
 
+/* Synchronous helper used by both the thumbnailer and the viewer to
+ * capture a single frame from a video file. This duplicates the core
+ * pipeline logic used by the thumbnail worker but exposes it as a
+ * reusable API. */
+bool
+thumbnails_capture_video_frame(const char *path, int width, GdkPixbuf **out_pixbuf, GError **error)
+{
+    g_return_val_if_fail(out_pixbuf != NULL, FALSE);
+    *out_pixbuf = NULL;
+
+    if (!gst_is_initialized()) gst_init(NULL, NULL);
+
+    if (!path || path[0] == '\0') {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "invalid path");
+        return FALSE;
+    }
+
+    gchar *uri = g_filename_to_uri(path, NULL, NULL);
+    gchar *pipeline_cmd;
+    if (width > 0)
+        pipeline_cmd = g_strdup_printf(
+            "uridecodebin uri=\"%s\" ! videoconvert ! videoscale ! video/x-raw,width=%d,pixel-aspect-ratio=1/1 ! gdkpixbufsink name=sink",
+            uri, width);
+    else
+        pipeline_cmd = g_strdup_printf(
+            "uridecodebin uri=\"%s\" ! videoconvert ! gdkpixbufsink name=sink",
+            uri);
+    g_free(uri);
+
+    GError *err = NULL;
+    GstElement *pipeline = gst_parse_launch(pipeline_cmd, &err);
+    g_free(pipeline_cmd);
+
+    if (!pipeline) {
+        g_propagate_error(error, err);
+        return FALSE;
+    }
+
+    GstElement *sink = gst_bin_get_by_name(GST_BIN(pipeline), "sink");
+
+    gst_element_set_state(pipeline, GST_STATE_PAUSED);
+    GstStateChangeReturn ret = gst_element_get_state(pipeline, NULL, NULL, 5 * GST_SECOND);
+
+    GdkPixbuf *pixbuf = NULL;
+    if (ret == GST_STATE_CHANGE_SUCCESS || ret == GST_STATE_CHANGE_NO_PREROLL) {
+        g_object_get(sink, "last-pixbuf", &pixbuf, NULL);
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(pipeline);
+    if (sink) gst_object_unref(sink);
+
+    if (!pixbuf) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "Failed to capture video frame");
+        return FALSE;
+    }
+
+    *out_pixbuf = pixbuf; /* caller owns ref */
+    return TRUE;
+}
+
+
 static void
 create_video_thumbnail_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
     char *path = (char *)task_data;
