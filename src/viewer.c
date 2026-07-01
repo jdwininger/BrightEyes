@@ -94,6 +94,10 @@ struct _Viewer {
     /* Scroll accumulation for smooth zoom */
     double scroll_accumulator;
     guint scroll_timeout_id;
+    /* Last known pointer position in scrolled-window coordinates. */
+    double last_pointer_x;
+    double last_pointer_y;
+    gboolean have_pointer;
     /* Animated GIF support */
     GdkPixbufAnimation *animation;
     GdkPixbufAnimationIter *anim_iter;
@@ -162,6 +166,8 @@ static void viewer_update_image(Viewer *self);
 static double get_fit_zoom_level(Viewer *self);
 static double get_fit_width_zoom(Viewer *self);
 static void viewer_set_zoom_level_internal(Viewer *self, double target_scale, gboolean center);
+static void viewer_set_zoom_level_anchor_content(Viewer *self, double target_scale, double content_x, double content_y);
+static void viewport_to_content_coords(Viewer *self, double viewport_x, double viewport_y, double scale, double *out_x, double *out_y);
 static gboolean run_load_race_test_cb(gpointer user_data);
 static void handle_loaded_pixbuf(Viewer *self, GdkPixbuf *pixbuf);
 static gboolean animation_tick(gpointer user_data);
@@ -206,6 +212,9 @@ static void on_gif_play_backward_clicked(GtkButton *btn, Viewer *self);
 static void on_gif_step_forward_clicked(GtkButton *btn, Viewer *self);
 static void on_gif_step_backward_clicked(GtkButton *btn, Viewer *self);
 static void on_gif_stop_clicked(GtkButton *btn, Viewer *self);
+static gboolean on_scroll(GtkEventControllerScroll *controller, gdouble dx, gdouble dy, gpointer user_data);
+static void on_pointer_motion(GtkEventControllerMotion *controller, gdouble x, gdouble y, gpointer user_data);
+static void on_pointer_leave(GtkEventControllerMotion *controller, gpointer user_data);
 
 /* Save-frame handlers (forward-declared so viewer_init may connect the button)
  * on_save_video_frame_response: completes the GtkFileDialog save request,
@@ -311,7 +320,69 @@ on_empty_open_clicked(GtkButton *btn, Viewer *self)
     g_signal_emit(self, signals[SIGNAL_OPEN_REQUESTED], 0);
 }
 
-/* on_scroll removed: scroll-wheel zoom is disabled while debugging anchored zoom behavior. */
+static void
+on_pointer_motion(GtkEventControllerMotion *controller, gdouble x, gdouble y, gpointer user_data)
+{
+    (void)controller;
+    Viewer *self = VIEWER(user_data);
+    self->last_pointer_x = x;
+    self->last_pointer_y = y;
+    self->have_pointer = TRUE;
+}
+
+static void
+on_pointer_leave(GtkEventControllerMotion *controller, gpointer user_data)
+{
+    (void)controller;
+    Viewer *self = VIEWER(user_data);
+    self->have_pointer = FALSE;
+}
+
+/* Mouse-wheel zoom anchored at pointer location in the viewport. */
+static gboolean
+on_scroll(GtkEventControllerScroll *controller, gdouble dx, gdouble dy, gpointer user_data)
+{
+    (void)controller;
+    (void)dx;
+
+    Viewer *self = VIEWER(user_data);
+    if (!self || !self->original_pixbuf) return GDK_EVENT_PROPAGATE;
+    if (self->selection_mode) return GDK_EVENT_PROPAGATE;
+
+    /* Keep default wheel behavior (scroll/pan) unless Ctrl is held. */
+    GdkModifierType state = gtk_event_controller_get_current_event_state(GTK_EVENT_CONTROLLER(controller));
+    if ((state & GDK_CONTROL_MASK) == 0)
+        return GDK_EVENT_PROPAGATE;
+
+    if (fabs(dy) < 1e-6) return GDK_EVENT_PROPAGATE;
+
+    GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+
+    double page_x = gtk_adjustment_get_page_size(hadj);
+    double page_y = gtk_adjustment_get_page_size(vadj);
+    if (page_x <= 0.0 || page_y <= 0.0) return GDK_EVENT_STOP;
+
+    double before_scale = self->fit_to_window ? get_fit_zoom_level(self) : self->zoom_level;
+    if (before_scale <= 1e-6) return GDK_EVENT_STOP;
+
+    /* dy > 0 means wheel down (zoom out), dy < 0 means wheel up (zoom in). */
+    double factor = pow(1.15, -dy);
+    double target = before_scale * factor;
+
+    double anchor_x = page_x / 2.0;
+    double anchor_y = page_y / 2.0;
+    if (self->have_pointer) {
+        anchor_x = CLAMP(self->last_pointer_x, 0.0, page_x);
+        anchor_y = CLAMP(self->last_pointer_y, 0.0, page_y);
+    }
+
+    double content_x = 0.0, content_y = 0.0;
+    viewport_to_content_coords(self, anchor_x, anchor_y, before_scale, &content_x, &content_y);
+
+    viewer_set_zoom_level_anchor_content(self, target, content_x, content_y);
+    return GDK_EVENT_STOP;
+}
 
 
 static gboolean
@@ -536,6 +607,9 @@ viewer_init(Viewer *self)
     self->default_fit = TRUE;
     self->scroll_accumulator = 0.0;
     self->scroll_timeout_id = 0;
+    self->last_pointer_x = 0.0;
+    self->last_pointer_y = 0.0;
+    self->have_pointer = FALSE;
     /* animation pipeline removed; no animation state */
     self->original_texture = NULL;
     self->original_texture_rotation_angle = -1;
@@ -797,12 +871,15 @@ viewer_init(Viewer *self)
     gtk_widget_set_vexpand(GTK_WIDGET(self), TRUE);
     gtk_box_append(GTK_BOX(self), GTK_WIDGET(self->overlay));
 
-    /* Scroll-wheel zooming temporarily disabled. Use buttons for zoom in/out.
-       To re-enable, restore the scroll controller and handler (see history). */
-    /* GtkEventController *scroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
-    gtk_event_controller_set_propagation_phase(scroll, GTK_PHASE_CAPTURE);
-    g_signal_connect(scroll, "scroll", G_CALLBACK(on_scroll), self);
-    gtk_widget_add_controller(GTK_WIDGET(self), scroll); */
+     GtkEventController *scroll = gtk_event_controller_scroll_new(GTK_EVENT_CONTROLLER_SCROLL_VERTICAL);
+     gtk_event_controller_set_propagation_phase(scroll, GTK_PHASE_CAPTURE);
+     g_signal_connect(scroll, "scroll", G_CALLBACK(on_scroll), self);
+     gtk_widget_add_controller(GTK_WIDGET(self->scrolled_window), scroll);
+
+     GtkEventController *motion = gtk_event_controller_motion_new();
+     g_signal_connect(motion, "motion", G_CALLBACK(on_pointer_motion), self);
+     g_signal_connect(motion, "leave", G_CALLBACK(on_pointer_leave), self);
+     gtk_widget_add_controller(GTK_WIDGET(self->scrolled_window), motion);
     
     /* Add Pan Gesture to ScrolledWindow (Stable reference for panning) */
     GtkGesture *pan = gtk_gesture_drag_new();
@@ -2230,10 +2307,21 @@ viewer_update_image(Viewer *self)
         if (new_width <= (int)page_x && new_height <= (int)page_y) {
             gtk_widget_set_halign(self->image_stack, GTK_ALIGN_CENTER);
             gtk_widget_set_valign(self->image_stack, GTK_ALIGN_CENTER);
+        } else if (self->has_pending_center) {
+            /* During a center-preserving zoom transition (especially when
+             * leaving fit-to-window), keep content visually centered until the
+             * deferred scroll restoration runs. This avoids a one-frame jump
+             * to top-left before we restore viewport center. */
+            gtk_widget_set_halign(self->image_stack, GTK_ALIGN_CENTER);
+            gtk_widget_set_valign(self->image_stack, GTK_ALIGN_CENTER);
         } else {
-            /* Do NOT use FILL here or the stack will stay viewport-sized. */
-            gtk_widget_set_halign(self->image_stack, GTK_ALIGN_START);
-            gtk_widget_set_valign(self->image_stack, GTK_ALIGN_START);
+            /* Align per-axis so we only anchor to start on axes that are
+             * actually scrollable. This avoids jumping to upper-left when
+             * only one axis exceeds the viewport. */
+            gtk_widget_set_halign(self->image_stack,
+                                  (new_width > (int)page_x) ? GTK_ALIGN_START : GTK_ALIGN_CENTER);
+            gtk_widget_set_valign(self->image_stack,
+                                  (new_height > (int)page_y) ? GTK_ALIGN_START : GTK_ALIGN_CENTER);
         }
 
         /* The picture should fill the stack allocation. */
@@ -2363,6 +2451,17 @@ update_alloc_overlay(gpointer user_data)
         
         gtk_adjustment_set_value(hadj, new_val_x);
         gtk_adjustment_set_value(vadj, new_val_y);
+
+        /* After restoring the viewport center, keep axes that can scroll
+         * anchored at start, while keeping non-scroll axes centered. */
+        if (orig_w_disp > 0 && orig_h_disp > 0) {
+            double content_w = (double)orig_w_disp * self->zoom_level;
+            double content_h = (double)orig_h_disp * self->zoom_level;
+            gtk_widget_set_halign(self->image_stack,
+                                  (content_w > page_x) ? GTK_ALIGN_START : GTK_ALIGN_CENTER);
+            gtk_widget_set_valign(self->image_stack,
+                                  (content_h > page_y) ? GTK_ALIGN_START : GTK_ALIGN_CENTER);
+        }
         
         g_debug("update_alloc_overlay: restored center to scroll pos (%f, %f) upper=(%f,%f)",
             new_val_x, new_val_y, upper_h, upper_v);
@@ -2821,6 +2920,66 @@ get_fit_width_zoom(Viewer *self)
     return alloc_w / (double)img_w;
 }
 
+static void
+viewer_set_zoom_level_anchor_content(Viewer *self, double target_scale, double content_x, double content_y)
+{
+    double before_scale = self->fit_to_window ? get_fit_zoom_level(self) : self->zoom_level;
+    double min_scale = get_fit_zoom_level(self);
+    double max_scale = 10.0;
+    target_scale = MAX(min_scale, MIN(max_scale, target_scale));
+
+    if (fabs(target_scale - before_scale) < 1e-6) return;
+
+    self->pending_center_x = content_x;
+    self->pending_center_y = content_y;
+    self->has_pending_center = TRUE;
+    self->center_retry_count = 0;
+
+    self->fit_to_window = FALSE;
+    self->fit_to_width = FALSE;
+    self->zoom_level = target_scale;
+    viewer_update_image(self);
+}
+
+/* Convert a viewport point (inside scrolled window) into image-content
+ * coordinates at the given scale, accounting for centered alignment when
+ * content is smaller than the viewport. */
+static void
+viewport_to_content_coords(Viewer *self, double viewport_x, double viewport_y, double scale, double *out_x, double *out_y)
+{
+    if (!self || !self->original_pixbuf || scale <= 1e-6) {
+        if (out_x) *out_x = 0.0;
+        if (out_y) *out_y = 0.0;
+        return;
+    }
+
+    int img_w = gdk_pixbuf_get_width(self->original_pixbuf);
+    int img_h = gdk_pixbuf_get_height(self->original_pixbuf);
+    if (self->rotation_angle == 90 || self->rotation_angle == 270) {
+        int t = img_w;
+        img_w = img_h;
+        img_h = t;
+    }
+
+    GtkAdjustment *hadj = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+    GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
+    double page_x = gtk_adjustment_get_page_size(hadj);
+    double page_y = gtk_adjustment_get_page_size(vadj);
+    double val_x = gtk_adjustment_get_value(hadj);
+    double val_y = gtk_adjustment_get_value(vadj);
+
+    double content_w = (double)img_w * scale;
+    double content_h = (double)img_h * scale;
+    double off_x = (content_w < page_x) ? (page_x - content_w) / 2.0 : 0.0;
+    double off_y = (content_h < page_y) ? (page_y - content_h) / 2.0 : 0.0;
+
+    double px = val_x + viewport_x - off_x;
+    double py = val_y + viewport_y - off_y;
+
+    if (out_x) *out_x = CLAMP(px / scale, 0.0, (double)img_w);
+    if (out_y) *out_y = CLAMP(py / scale, 0.0, (double)img_h);
+}
+
 /* Internal setter that preserves viewport center when requested */
 static void
 viewer_set_zoom_level_internal(Viewer *self, double target_scale, gboolean center)
@@ -2838,10 +2997,7 @@ viewer_set_zoom_level_internal(Viewer *self, double target_scale, gboolean cente
         GtkAdjustment *vadj = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(self->scrolled_window));
         double page_x = gtk_adjustment_get_page_size(hadj);
         double page_y = gtk_adjustment_get_page_size(vadj);
-        double val_x = gtk_adjustment_get_value(hadj);
-        double val_y = gtk_adjustment_get_value(vadj);
-        content_center_x = (val_x + page_x / 2.0) / before_scale;
-        content_center_y = (val_y + page_y / 2.0) / before_scale;
+        viewport_to_content_coords(self, page_x / 2.0, page_y / 2.0, before_scale, &content_center_x, &content_center_y);
         
         self->pending_center_x = content_center_x;
         self->pending_center_y = content_center_y;

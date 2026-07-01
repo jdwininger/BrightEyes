@@ -23,6 +23,7 @@ gstvideo_dep = dependency('gstreamer-video-1.0', required: false)
 gio_dep = dependency('gio-2.0', required: true)
 
 gnome = import('gnome')
+fs = import('fs')
 resources = gnome.compile_resources('brighteyes-resources',
   'brighteyes.gresource.xml',
   source_dir : '.'
@@ -58,7 +59,7 @@ bex = executable('brighteyes', sources + resources,
 # and tolerant of missing GStreamer (falls back to image-only capture).
 # This prevents regressions of the --test-save-frame path.
 test('save-frame-cli', bex, args : ['--test-save-frame', 'test-out-save-frame.png'],
-     workdir : meson.source_root())
+  workdir : meson.project_source_root())
 
 # Small test tool to exercise archive conversion logic from the command line
 executable('archive-convert-test', 'tools/convert_test.c',
@@ -71,13 +72,15 @@ executable('zip-test', 'tools/zip_test.c',
   install : false
 )
 
-image_convert_test_exe = executable('image-convert-test', 'tools/image_convert_test.c',
-  dependencies : [gdkpixbuf_dep, glib_dep],
-  install : false
-)
+if fs.exists('tools/image_convert_test.c')
+  image_convert_test_exe = executable('image-convert-test', 'tools/image_convert_test.c',
+    dependencies : [gdkpixbuf_dep, glib_dep],
+    install : false
+  )
 
-test('image-convert', image_convert_test_exe, args : ['icon-1024.png', 'test-out.png', 'test-out.jpg', '85', '#ffffff'],
-     workdir : meson.source_root())
+    test('image-convert', image_convert_test_exe, args : ['icon-1024.png', 'test-out.png', 'test-out.jpg', '85', '#ffffff'],
+      workdir : meson.project_source_root())
+endif
 
 
 
@@ -109,27 +112,31 @@ if libarchive_dep.found()
       dependencies : [gst_dep, gdkpixbuf_dep, glib_dep],
       install : false
     )
-    test('video-frame-capture-smoke', video_capture_smoke, workdir : meson.source_root())
+    test('video-frame-capture-smoke', video_capture_smoke, workdir : meson.project_source_root())
 
-    save_frame_gui_test = executable('save-frame-gui', ['tools/save_frame_gui_test.c', 'src/thumbnails.c', 'src/viewer.c'],
-      dependencies : [gst_dep, gdkpixbuf_dep, glib_dep, gtk_dep, adwaita_dep],
-      install : false
-    )
-    test('save-frame-gui', save_frame_gui_test, workdir : meson.source_root())
+    if fs.exists('tools/save_frame_gui_test.c')
+      save_frame_gui_test = executable('save-frame-gui', ['tools/save_frame_gui_test.c', 'src/thumbnails.c', 'src/viewer.c'],
+        dependencies : [gst_dep, gdkpixbuf_dep, glib_dep, gtk_dep, adwaita_dep],
+        install : false
+      )
+      test('save-frame-gui', save_frame_gui_test, workdir : meson.project_source_root())
+    endif
   endif
 
   # Exercise the video-frame capture pipeline using a single-image source
   # (GStreamer treats images as single-frame videos). This validates the
   # same capture code path used by the viewer's "Save frame" action.
-  test('thumbnailer-video-frame', th_exe, args : ['icon-1024.png', 'test-out-video-frame.png', '64'],
-       workdir : meson.source_root())
+    test('thumbnailer-video-frame', th_exe, args : ['icon-1024.png', 'test-out-video-frame.png', '64'],
+      workdir : meson.project_source_root())
 
 endif
 
 install_data('data/org.jeremy.BrightEyes.desktop', install_dir : 'share/applications')
 install_data('data/org.jeremy.BrightEyes.xml', install_dir : 'share/mime/packages')
 install_data('data/org.jeremy.BrightEyes.thumbnailer', install_dir : 'share/thumbnailers')
-install_data('data/org.jeremy.BrightEyes.gschema.xml', install_dir : 'share/glib-2.0/schemas')
+if fs.exists('data/org.jeremy.BrightEyes.gschema.xml')
+  install_data('data/org.jeremy.BrightEyes.gschema.xml', install_dir : 'share/glib-2.0/schemas')
+endif
 install_data('icon-1024.png', install_dir : 'share/icons/hicolor/1024x1024/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('icon-1024.png', install_dir : 'share/icons/hicolor/512x512/apps', rename : 'org.jeremy.BrightEyes.png')
 install_data('LICENSE', install_dir : 'share/licenses/brighteyes')

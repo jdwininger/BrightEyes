@@ -10,7 +10,7 @@ G_BEGIN_DECLS
  * On success, the result is a newly-allocated string (UTF-8) returned from
  * ocr_recognize_image_finish, which the caller must free with g_free(). */
 
-void ocr_recognize_image_async(const char *path, const char *lang, const char *datapath, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data);
+void ocr_recognize_image_async(const char *path, const char *lang, const char *datapath, int min_confidence, GCancellable *cancellable, GAsyncReadyCallback callback, gpointer user_data);
 char *ocr_recognize_image_finish(GAsyncResult *result, GError **error);
 
 G_END_DECLS

@@ -39,6 +39,7 @@ static gboolean previously_declined_cbr(const char *path);
 static void record_declined_cbr(const char *path);
 
 static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const char *tmp_path);
+static void present_full_image_ocr_warning(BrightEyesWindow *self, const char *path);
 struct _BrightEyesWindow {
     AdwApplicationWindow parent_instance;
     Viewer *viewer;
@@ -528,7 +529,7 @@ on_ocr_whole_action(GSimpleAction *action, GVariant *parameter, gpointer user_da
     (void)parameter;
     BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
     const char *path = curator_get_current(self->curator);
-    start_ocr_for_path(self, path, NULL);
+    present_full_image_ocr_warning(self, path);
 }
 
 static void
@@ -555,6 +556,44 @@ on_selection_cancel_response(AdwAlertDialog *dlg, const char *response, gpointer
          adw_toast_set_action_name(toast, "win.ocr-selection");
          adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), toast);
     }
+}
+
+static void
+on_full_image_warning_response(AdwAlertDialog *dlg, const char *response, gpointer user_data)
+{
+    (void)dlg;
+    BrightEyesWindow *self = BRIGHT_EYES_WINDOW(user_data);
+    const char *path = curator_get_current(self->curator);
+
+    if (g_strcmp0(response, "selection") == 0) {
+        viewer_set_selection_mode(self->viewer, TRUE);
+        AdwToast *toast = adw_toast_new("Selection Mode: Draw a box on the image.");
+        adw_toast_set_timeout(toast, 0);
+        adw_toast_set_button_label(toast, "Scan");
+        adw_toast_set_action_name(toast, "win.ocr-selection");
+        adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), toast);
+    } else if (g_strcmp0(response, "continue") == 0) {
+        start_ocr_for_path(self, path, NULL);
+    }
+}
+
+static void
+present_full_image_ocr_warning(BrightEyesWindow *self, const char *path)
+{
+    if (!path)
+        return;
+
+    AdwAlertDialog *dlg = ADW_ALERT_DIALOG(adw_alert_dialog_new(
+        "Use Selection for mixed images",
+        "Images with mixed text and graphics usually work better with Selection OCR. Full-image OCR can pick up page chrome, labels, and fragments instead of the text you want."));
+    adw_alert_dialog_add_responses(dlg,
+                                   "selection", "Use Selection",
+                                   "continue", "Continue Anyway",
+                                   NULL);
+    adw_alert_dialog_set_default_response(dlg, "selection");
+    adw_alert_dialog_set_close_response(dlg, "selection");
+    g_signal_connect(dlg, "response", G_CALLBACK(on_full_image_warning_response), self);
+    adw_dialog_present(ADW_DIALOG(dlg), GTK_WIDGET(self));
 }
 
 static void
@@ -806,25 +845,27 @@ show_save_options_dialog(BrightEyesWindow *self, const char *dest_path, const ch
     gtk_box_set_spacing(GTK_BOX(content), 8);
 
     /* Initialize from GSettings defaults (guarded) */
+    int def_q = 85;
     GSettings *settings = get_settings_safe();
     if (!settings) {
         g_warning("show_save_options_dialog: GSettings schema not installed; using defaults");
         if (self->toast_overlay)
             adw_toast_overlay_add_toast(ADW_TOAST_OVERLAY(self->toast_overlay), adw_toast_new("Settings unavailable — using defaults"));
-    }
-    int def_q = (int)g_settings_get_int(settings, "jpeg-quality");
-    const char *hex = g_settings_get_string(settings, "jpeg-bg-color");
-    if (hex) {
-        int rr, gg, bb;
-        if (sscanf(hex, "#%02x%02x%02x", &rr, &gg, &bb) == 3) {
-            gtk_spin_button_set_value(GTK_SPIN_BUTTON(r_spin), rr);
-            gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_spin), gg);
-            gtk_spin_button_set_value(GTK_SPIN_BUTTON(b_spin), bb);
+    } else {
+        def_q = (int)g_settings_get_int(settings, "jpeg-quality");
+        char *hex = g_settings_get_string(settings, "jpeg-bg-color");
+        if (hex) {
+            int rr, gg, bb;
+            if (sscanf(hex, "#%02x%02x%02x", &rr, &gg, &bb) == 3) {
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(r_spin), rr);
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(g_spin), gg);
+                gtk_spin_button_set_value(GTK_SPIN_BUTTON(b_spin), bb);
+            }
+            g_free(hex);
         }
-        g_free((gpointer)hex);
+        g_object_unref(settings);
     }
     gtk_range_set_value(GTK_RANGE(quality), def_q);
-    g_object_unref(settings);
 
     /* Store spinbutton pointers so response handler can read them */
     g_object_set_data(G_OBJECT(dlg), "bg-r-spin", r_spin);
@@ -1008,8 +1049,6 @@ toggle_metadata(BrightEyesWindow *self)
      adw_overlay_split_view_set_show_sidebar(self->metadata_view, !show);
 }
 
-typedef struct { BrightEyesWindow *win; GtkWindow *dlg; char *text; char *tmp_path; } OCRCallbackData;
-
 typedef struct {
     GtkWindow *window;
     GtkWidget *label;
@@ -1045,14 +1084,22 @@ create_spinner_window(BrightEyesWindow *self, const char *title, const char *mes
     return ui;
 }
 
-static void begin_ocr_async(BrightEyesWindow *self, const char *path, const char *lang, const char *datapath, const char *tmp_path);
+typedef struct {
+    BrightEyesWindow *win;
+    GtkWindow *dlg;
+    char *text;
+    char *tmp_path;
+    int min_confidence;
+} OCRCallbackData;
+
+static void begin_ocr_async(BrightEyesWindow *self, const char *path, const char *lang, const char *datapath, const char *tmp_path, int min_confidence);
 static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const char *tmp_path);
 
 static void show_ocr_result_dialog(BrightEyesWindow *w, const char *text);
 static void ocr_done_cb(GObject *source, GAsyncResult *res, gpointer user_data);
 
 static void
-begin_ocr_async(BrightEyesWindow *self, const char *path, const char *lang, const char *datapath, const char *tmp_path)
+begin_ocr_async(BrightEyesWindow *self, const char *path, const char *lang, const char *datapath, const char *tmp_path, int min_confidence)
 {
     SpinnerWindow ui = create_spinner_window(self, "Recognizing...", "Performing OCR...");
 
@@ -1062,9 +1109,10 @@ begin_ocr_async(BrightEyesWindow *self, const char *path, const char *lang, cons
     cbdata->win = self;
     cbdata->dlg = ui.window;
     cbdata->tmp_path = tmp_path ? g_strdup(tmp_path) : NULL;
+    cbdata->min_confidence = min_confidence;
 
     const char *effective_lang = lang ? lang : "eng";
-    ocr_recognize_image_async(path, effective_lang, datapath, NULL, ocr_done_cb, cbdata);
+    ocr_recognize_image_async(path, effective_lang, datapath, min_confidence, NULL, ocr_done_cb, cbdata);
 
     gtk_window_present(ui.window);
 }
@@ -1076,6 +1124,7 @@ typedef struct {
     char *cache_dir;
     GPtrArray *missing;
     guint index;
+    int min_confidence;
     SpinnerWindow ui;
 } DownloadFlow;
 
@@ -1092,7 +1141,7 @@ download_lang_finished(GObject *source, GAsyncResult *res, gpointer user_data)
         g_warning("Download failed: %s", err ? err->message : "unknown error");
         if (ctx->ui.window)
             gtk_window_destroy(ctx->ui.window);
-        begin_ocr_async(ctx->win, ctx->path, ctx->lang, NULL, NULL); /* fallback to lite */
+        begin_ocr_async(ctx->win, ctx->path, ctx->lang, NULL, NULL, ctx->min_confidence); /* fallback to lite */
         download_flow_free(ctx);
         g_clear_error(&err);
         return;
@@ -1107,7 +1156,7 @@ download_lang_finished(GObject *source, GAsyncResult *res, gpointer user_data)
     if (ctx->ui.window)
         gtk_window_destroy(ctx->ui.window);
 
-    begin_ocr_async(ctx->win, ctx->path, ctx->lang, ctx->cache_dir, NULL);
+    begin_ocr_async(ctx->win, ctx->path, ctx->lang, ctx->cache_dir, NULL, ctx->min_confidence);
     download_flow_free(ctx);
 }
 
@@ -1115,7 +1164,7 @@ static void
 download_next_lang(DownloadFlow *ctx)
 {
     if (ctx->index >= ctx->missing->len) {
-        begin_ocr_async(ctx->win, ctx->path, ctx->lang, ctx->cache_dir, NULL);
+        begin_ocr_async(ctx->win, ctx->path, ctx->lang, ctx->cache_dir, NULL, ctx->min_confidence);
         download_flow_free(ctx);
         return;
     }
@@ -1126,7 +1175,7 @@ download_next_lang(DownloadFlow *ctx)
         g_warning("No download source for %s; using lite model", code);
         if (ctx->ui.window)
             gtk_window_destroy(ctx->ui.window);
-        begin_ocr_async(ctx->win, ctx->path, ctx->lang, NULL, NULL);
+        begin_ocr_async(ctx->win, ctx->path, ctx->lang, NULL, NULL, ctx->min_confidence);
         download_flow_free(ctx);
         return;
     }
@@ -1153,7 +1202,7 @@ download_flow_free(DownloadFlow *ctx)
 }
 
 static void
-start_best_download(BrightEyesWindow *self, const char *path, const char *lang, const char *cache_dir, GPtrArray *missing)
+start_best_download(BrightEyesWindow *self, const char *path, const char *lang, const char *cache_dir, GPtrArray *missing, int min_confidence)
 {
     DownloadFlow *ctx = g_new0(DownloadFlow, 1);
     ctx->win = g_object_ref(self);
@@ -1162,6 +1211,7 @@ start_best_download(BrightEyesWindow *self, const char *path, const char *lang, 
     ctx->cache_dir = g_strdup(cache_dir);
     ctx->missing = missing; /* take ownership */
     ctx->index = 0;
+    ctx->min_confidence = min_confidence;
     ctx->ui = create_spinner_window(self, "Downloading OCR data", "Preparing download...");
     gtk_window_present(ctx->ui.window);
     download_next_lang(ctx);
@@ -1173,6 +1223,7 @@ typedef struct {
     char *lang;
     char *cache_dir;
     GPtrArray *missing;
+    int min_confidence;
 } OcrRequest;
 
 static void
@@ -1194,10 +1245,10 @@ on_best_choice(AdwMessageDialog *dialog, const char *response, gpointer user_dat
     OcrRequest *req = user_data;
 
     if (g_strcmp0(response, "download") == 0) {
-        start_best_download(req->win, req->path, req->lang, req->cache_dir, req->missing);
+        start_best_download(req->win, req->path, req->lang, req->cache_dir, req->missing, req->min_confidence);
         req->missing = NULL; /* ownership transferred */
     } else {
-        begin_ocr_async(req->win, req->path, req->lang, NULL, NULL);
+        begin_ocr_async(req->win, req->path, req->lang, NULL, NULL, req->min_confidence);
     }
 
     ocr_request_free(req);
@@ -1207,10 +1258,12 @@ static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const c
 {
     if (!path) return;
 
+    const int min_confidence = tmp_path ? 40 : 55;
+
     const char *lang = self->ocr_language ? self->ocr_language : "eng";
     g_autofree char *cache_dir = tessdata_cache_dir();
     if (!cache_dir) {
-        begin_ocr_async(self, path, lang, NULL, tmp_path);
+        begin_ocr_async(self, path, lang, NULL, tmp_path, min_confidence);
         return;
     }
 
@@ -1218,7 +1271,7 @@ static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const c
     if (!ensure_dir_exists(cache_dir, &dir_err)) {
         g_warning("Cannot prepare cache dir: %s", dir_err ? dir_err->message : "unknown error");
         g_clear_error(&dir_err);
-        begin_ocr_async(self, path, lang, NULL, tmp_path);
+        begin_ocr_async(self, path, lang, NULL, tmp_path, min_confidence);
         return;
     }
 
@@ -1226,7 +1279,7 @@ static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const c
     if (!missing || missing->len == 0) {
         if (missing)
             g_ptr_array_free(missing, TRUE);
-        begin_ocr_async(self, path, lang, cache_dir, tmp_path);
+        begin_ocr_async(self, path, lang, cache_dir, tmp_path, min_confidence);
         return;
     }
 
@@ -1243,6 +1296,7 @@ static void start_ocr_for_path(BrightEyesWindow *self, const char *path, const c
     req->lang = g_strdup(lang);
     req->cache_dir = g_strdup(cache_dir);
     req->missing = missing; /* ownership moved */
+    req->min_confidence = min_confidence;
 
     AdwAlertDialog *dlg = ADW_ALERT_DIALOG(adw_alert_dialog_new("Full accuracy download", body));
     adw_alert_dialog_add_responses(dlg,
@@ -1334,7 +1388,6 @@ open_text_cb(GtkWidget *btn, gpointer user_data)
     }
 
     /* Write content */
-    ssize_t len_total = 0;
     const char *p = write_buf;
     ssize_t to_write = strlen(write_buf);
     while (to_write > 0) {
@@ -1349,7 +1402,6 @@ open_text_cb(GtkWidget *btn, gpointer user_data)
         }
         to_write -= written;
         p += written;
-        len_total += written;
     }
     /* Ensure contents reach disk */
     if (fsync(fd) == -1) {
