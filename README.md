@@ -51,4 +51,4 @@ There is a Flatpak manifest at `org.jeremy.BrightEyes.yml` at the repo root. I a
 ## 📦 Publishing
 
 - GitHub Releases: RPM and DEB artifacts are attached by CI.
-- 🚀 **Release v0.2.0 (2026-01-13)**: Added Debian dependency `adwaita-icon-theme`, improved packaging, and refreshed documentation. 🎉🛠️
+- 🚀 **Release v0.2.2 (2026-07-01)**: Reverted the over-aggressive OCR filtering, added a warning for full-image OCR, and documented the handoff notes. 🎉🛠️

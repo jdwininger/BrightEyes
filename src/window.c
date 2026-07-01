@@ -2792,7 +2792,7 @@ on_about_action(GSimpleAction *action, GVariant *parameter, gpointer user_data)
     }
     
     adw_about_dialog_set_developers(dialog, developers);
-    adw_about_dialog_set_version(dialog, "0.1");
+    adw_about_dialog_set_version(dialog, "0.2.2");
     adw_about_dialog_set_copyright(dialog, "© 2026 Jeremy");
     adw_about_dialog_set_website(dialog, "https://github.com/jeremy/BrightEyes");
     adw_about_dialog_set_issue_url(dialog, "https://github.com/jeremy/BrightEyes/issues");
